@@ -8,7 +8,7 @@ from aiogram.enums import ParseMode
 from aiogram.types import BotCommand
 
 import config
-from bot.handlers import clan_create, clan_join, clan_info, clan_manage, duel
+from bot.handlers import clan_create, clan_join, clan_info, clan_manage, tactics, shop, duel, player_profile
 from bot.matchmaking import scheduler_loop
 from bot.handlers.duel import afk_watcher_loop
 from bot.season import season_watcher_loop
@@ -25,6 +25,9 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="leaveclan", description="Покинуть клан"),
         BotCommand(command="kick", description="Исключить участника (создатель клана)"),
         BotCommand(command="deleteclan", description="Расформировать клан (создатель)"),
+        BotCommand(command="tactic", description="Выбрать тактику клана на сезон"),
+        BotCommand(command="shop", description="Магазин привилегий за Те"),
+        BotCommand(command="iam", description="Мой профиль"),
         BotCommand(command="top", description="Топ кланов и игроков"),
         BotCommand(command="season", description="Сколько дней осталось до конца сезона"),
         BotCommand(command="minduel", description="Начать назначенную дуэль"),
@@ -42,7 +45,10 @@ async def main() -> None:
     dp.include_router(clan_join.router)
     dp.include_router(clan_info.router)
     dp.include_router(clan_manage.router)
+    dp.include_router(tactics.router)
+    dp.include_router(shop.router)
     dp.include_router(duel.router)
+    dp.include_router(player_profile.router)  # последним: ловит свободные текстовые триггеры
 
     await _set_commands(bot)
 
