@@ -9,8 +9,11 @@
        и/или у которого меньше всего очков ("аутсайдеры" в приоритете);
      * его соперник должен чередоваться: то другой аутсайдер, то лидер по очкам —
        чтобы у лидера тоже не было простоя, а у аутсайдеров был шанс "выстрелить";
- - внутри клана на бой отправляется участник, который дольше всех не участвовал
-   в дуэлях (round-robin), чтобы не играл всё время один и тот же человек.
+ - внутри клана на бой отправляется участник СТРОГО ПО СКРЫТОЙ ОЧЕРЕДИ
+   (игрок1 -> игрок2 -> игрок3 -> игрок1 -> ...), очередь не видна пользователям,
+   хранится в clan["queue"];
+ - если предыдущий вызов игрока клана остался неотыгранным, его попытка
+   переходит следующему в очереди с накоплением (см. bot/turns.py).
 
 Состояние чередования (кого позвать соперником — другого аутсайдера или лидера)
 хранится в самом db как db["matchmaking_alternate_leader"] (bool).
@@ -25,20 +28,32 @@ from aiogram import Bot
 import config
 from bot.storage import Storage, now
 from bot import texts
+from bot.clan_utils import ensure_clan_fields
 
 
 def _pick_member(clan: dict) -> Optional[dict]:
-    members = list(clan.get("members", {}).values())
+    """Выбирает следующего игрока клана строго по скрытой очереди (round-robin)."""
+    members = clan.get("members", {})
     if not members:
         return None
-    # тот, кто дольше всех не играл (или ни разу не играл -> last_played_at = 0)
-    members.sort(key=lambda m: (m.get("matches_played", 0), m.get("last_played_at", 0)))
-    return members[0]
+    member_ids = list(members.keys())
+    queue = [uid for uid in clan.get("queue", []) if uid in member_ids]
+    for uid in member_ids:
+        if uid not in queue:
+            queue.append(uid)
+    if not queue:
+        return None
+    next_uid = queue.pop(0)
+    queue.append(next_uid)
+    clan["queue"] = queue
+    return members[next_uid]
 
 
 def pick_duel_pair(db: dict) -> Optional[Tuple[dict, dict, dict, dict]]:
     """Возвращает (clan_a, member_a, clan_b, member_b) либо None, если играть некому."""
     clans = [c for c in db["clans"].values() if c.get("members")]
+    for c in clans:
+        ensure_clan_fields(c)
     if len(clans) < 2:
         return None
 
@@ -83,27 +98,50 @@ async def announce_duel(bot: Bot) -> Tuple[bool, str]:
             return False, "Недостаточно кланов с участниками для дуэли (нужно минимум 2 клана с игроками)."
         clan_a, member_a, clan_b, member_b = pair
 
+        attempts_a = clan_a.get("carried_attempts", 1)
+        attempts_b = clan_b.get("carried_attempts", 1)
+        clan_a["carried_attempts"] = 1
+        clan_b["carried_attempts"] = 1
+
         db["pending_invite"] = {
             "clan_a_id": clan_a["id"],
             "player_a_id": member_a["user_id"],
             "clan_b_id": clan_b["id"],
             "player_b_id": member_b["user_id"],
+            "attempts_a": attempts_a,
+            "attempts_b": attempts_b,
             "created_at": now(),
+            "message_id": None,
         }
         name_a = f'@{member_a["username"]}' if member_a.get("username") else member_a.get("first_name", "Игрок")
         name_b = f'@{member_b["username"]}' if member_b.get("username") else member_b.get("first_name", "Игрок")
         text = texts.duel_invite_text(name_a, name_b)
 
+        skip_notes = db.pop("pending_skip_notes", [])
+        if skip_notes:
+            text = "\n".join(skip_notes) + "\n\n" + text
+
     try:
-        await bot.send_message(group_id, text, parse_mode="HTML")
+        sent = await bot.send_message(group_id, text, parse_mode="HTML")
     except Exception as e:
+        async with Storage() as db:
+            db["pending_invite"] = None
         return False, f"Не удалось отправить сообщение в боевой чат: {e}"
+
+    async with Storage() as db:
+        if db.get("pending_invite"):
+            db["pending_invite"]["message_id"] = sent.message_id
+            db["pending_invite"]["chat_id"] = sent.chat.id
+    try:
+        await bot.pin_chat_message(sent.chat.id, sent.message_id, disable_notification=True)
+    except Exception:
+        pass  # бот может быть не админом — не критично, просто без закрепления
 
     return True, f"Дуэль объявлена: «{clan_a['name']}» vs «{clan_b['name']}»."
 
 
 async def scheduler_loop(bot: Bot) -> None:
-    """Фоновая задача: раз в ~2 дня (со случайным разбросом) объявляет новую дуэль."""
+    """Фоновая задача: раз в ~6 часов (со случайным разбросом) объявляет новую дуэль."""
     while True:
         interval_hours = random.uniform(
             config.DUEL_INTERVAL_MIN_HOURS, config.DUEL_INTERVAL_MAX_HOURS

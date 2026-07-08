@@ -67,20 +67,35 @@ def board_header(mines: int, opened: int, current_multiplier: float, next_progre
     return header
 
 
-def lose_text(clan_name: str, new_points: float) -> str:
+def lose_text(clan_name: str, old_points: float, new_points: float, possible_multiplier: float, possible_al: int) -> str:
     return (
         "💥 <b>Бум! Вы подорвались на мине.</b>\n"
-        f"Очки клана «{clan_name}» умножены на {LOSS_MULTIPLIER}.\n"
+        f"Если бы забрали сейчас: x{possible_multiplier:.2f}".replace(".", ",") + f" ({possible_al} Al)\n"
+        f"Очки клана «{clan_name}» до мины: <b>{old_points:g}</b>\n"
+        f"Очки умножены на {LOSS_MULTIPLIER}.\n"
         f"Новые очки клана: <b>{new_points:g}</b>"
     )
 
 
-def cashout_text(clan_name: str, multiplier: float, won_al: int, new_points: float) -> str:
-    return (
+def cashout_text(clan_name: str, multiplier: float, won_al: int, new_points: float, weekly_pct: int = 0, base_al: int = None) -> str:
+    text = (
         "✅ <b>Вы забрали выигрыш!</b>\n"
         f"Множитель: x{multiplier:.2f}".replace(".", ",") + f" ({won_al} Al)\n"
-        f"Очки клана «{clan_name}» обновлены: <b>{new_points:g}</b>"
     )
+    if weekly_pct and base_al is not None and base_al != won_al:
+        sign = "+" if weekly_pct > 0 else ""
+        diff = won_al - base_al
+        diff_sign = "+" if diff >= 0 else ""
+        text += (
+            f"📉 Недельный {'бафф' if weekly_pct > 0 else 'дебафф'} клана: {sign}{weekly_pct}% "
+            f"→ без него было бы {base_al} Al ({diff_sign}{diff} Al)\n"
+        )
+    text += f"Очки клана «{clan_name}» обновлены: <b>{new_points:g}</b>"
+    return text
+
+
+def attempts_remaining_text(remaining: int) -> str:
+    return f"‼️У вас осталось {remaining} попыт{'ка' if remaining == 1 else ('ки' if remaining < 5 else 'ок')}‼️"
 
 
 def afk_autocashout_text(username: str) -> str:

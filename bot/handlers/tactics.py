@@ -13,10 +13,10 @@ router = Router(name="tactics")
 TACTIC_DESCRIPTIONS = {
     "quiet": (
         "🐢 <b>Тихо не спеша мальчик ты куда</b>\n"
-        "Раз в 7 дней сезона, когда очки кланов подтягиваются к среднему, для "
-        "вашего клана эффект мягче: если вы в топе — теряете всего 4% (а не по "
-        "формуле), если в аутсайдерах — получаете всего +6%. Клан заранее не "
-        "знает, кем окажется на момент применения."
+        "Раз в 7 дней сезона, когда очки кланов могут получить бафф или дебафф, "
+        "для вашего клана эффект мягче: если вы в топе — теряете всего −6% ко "
+        "всем выигранным очкам в минах, если в аутсайдерах — получаете всего "
+        "+6% к выигранным очкам в минах."
     ),
     "red": (
         "🩸 <b>Мы уже красные</b>\n"
@@ -37,9 +37,10 @@ TACTIC_DESCRIPTIONS = {
     ),
     "gamble": (
         "🎲 <b>Азарт</b>\n"
-        "Перед каждым раундом выпадает случайный эффект: 🍀 Фортуна (+20% "
-        "очков), 🛡 Броня (штраф x0.85), 💰 Золотая жила (Те x3), 💣 Безумие "
-        "(+20% очков, но штраф x0.65), ☠ Неудача (−20% очков)."
+        "Перед каждым раундом выпадает случайный эффект (виден и его описание "
+        "прямо в игре): 🍀 Фортуна (+20% очков), 🛡 Броня (штраф x0.85), "
+        "💰 Золотая жила (Те x3), 💣 Безумие (+20% очков, но штраф x0.65), "
+        "☠ Неудача (−20% очков)."
     ),
 }
 
@@ -64,10 +65,16 @@ async def cmd_tactic(message: Message) -> None:
         ensure_clan_fields(clan)
         current = clan.get("tactic")
 
-    current_text = (
-        f"\n\nТекущая тактика: <b>{config.SEASON_TACTICS.get(current, 'не выбрана')}</b>"
-        if current else "\n\nТактика пока не выбрана."
-    )
+        if clan.get("tactic_locked"):
+            name = config.SEASON_TACTICS.get(current, current)
+            await message.reply(
+                f"Тактика на этот сезон уже выбрана: <b>{name}</b>.\n"
+                "Сменить её можно будет только в начале следующего сезона.",
+                parse_mode="HTML",
+            )
+            return
+
+    current_text = "\n\nТактика пока не выбрана."
 
     builder = InlineKeyboardBuilder()
     for key, name in config.SEASON_TACTICS.items():
@@ -96,10 +103,17 @@ async def cb_tactic_set(callback: CallbackQuery) -> None:
             await callback.answer("Только создатель клана может это менять.", show_alert=True)
             return
         ensure_clan_fields(clan)
+        if clan.get("tactic_locked"):
+            await callback.answer("Тактика на этот сезон уже выбрана и заблокирована.", show_alert=True)
+            return
         clan["tactic"] = key
+        clan["tactic_locked"] = True
         clan["consecutive_losses"] = 0
         clan["tactic_consecutive_wins"] = 0
         name = config.SEASON_TACTICS.get(key, key)
 
-    await callback.message.edit_text(f"✅ Тактика клана на этот сезон: <b>{name}</b>", parse_mode="HTML")
+    await callback.message.edit_text(
+        f"✅ Тактика клана на этот сезон: <b>{name}</b>\n(сменить можно будет только в следующем сезоне)",
+        parse_mode="HTML",
+    )
     await callback.answer()

@@ -61,9 +61,10 @@ _DEFAULT_DB: Dict[str, Any] = {
     "pending_invite": None,
     "active_duels": {},
     "season_started_at": None,
-    "last_convergence_at": None,
+    "last_weekly_modifier_at": None,
     "reputation_reset_year": None,
     "players": {},
+    "pending_skip_notes": [],
 }
 
 

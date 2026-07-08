@@ -17,11 +17,26 @@ import random
 import config
 
 GAMBLE_EFFECTS = {
-    "fortuna": {"emoji": "🍀", "name": "Фортуна", "win_mult": 1.20, "loss_mult": None, "te_mult": 1.0},
-    "bronya": {"emoji": "🛡", "name": "Броня", "win_mult": 1.0, "loss_mult": 0.85, "te_mult": 1.0},
-    "zoloto": {"emoji": "💰", "name": "Золотая жила", "win_mult": 1.0, "loss_mult": None, "te_mult": 3.0},
-    "bezumie": {"emoji": "💣", "name": "Безумие", "win_mult": 1.20, "loss_mult": 0.65, "te_mult": 1.0},
-    "neudacha": {"emoji": "☠", "name": "Неудача", "win_mult": 0.80, "loss_mult": None, "te_mult": 1.0},
+    "fortuna": {
+        "emoji": "🍀", "name": "Фортуна", "win_mult": 1.20, "loss_mult": None, "te_mult": 1.0,
+        "desc": "+20% к очкам за победу в этом раунде",
+    },
+    "bronya": {
+        "emoji": "🛡", "name": "Броня", "win_mult": 1.0, "loss_mult": 0.85, "te_mult": 1.0,
+        "desc": "при поражении штраф всего x0.85 (вместо x0.75)",
+    },
+    "zoloto": {
+        "emoji": "💰", "name": "Золотая жила", "win_mult": 1.0, "loss_mult": None, "te_mult": 3.0,
+        "desc": "валюта Те за этот раунд x3",
+    },
+    "bezumie": {
+        "emoji": "💣", "name": "Безумие", "win_mult": 1.20, "loss_mult": 0.65, "te_mult": 1.0,
+        "desc": "+20% к очкам за победу, но при поражении штраф x0.65",
+    },
+    "neudacha": {
+        "emoji": "☠", "name": "Неудача", "win_mult": 0.80, "loss_mult": None, "te_mult": 1.0,
+        "desc": "−20% к очкам за победу в этом раунде",
+    },
 }
 
 
@@ -75,6 +90,16 @@ def currency_multiplier(clan: dict, side: dict) -> float:
         if effect:
             mult *= effect.get("te_mult", 1.0)
     return mult
+
+
+def weekly_modifier_fraction(clan: dict) -> float:
+    """Текущий накопленный %-баф/дебафф клана в виде доли (например -0.20 = -20%)."""
+    return clan.get("weekly_percent_modifier", 0) / 100
+
+
+def weekly_modifier_multiplier(clan: dict) -> float:
+    """Множитель к очкам раунда с учётом накопленного недельного бафа/дебаффа (не ниже 0)."""
+    return max(0.0, 1 + weekly_modifier_fraction(clan))
 
 
 def register_round_result(clan: dict, won: bool) -> None:

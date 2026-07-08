@@ -116,8 +116,12 @@ async def process_motto(message: Message, state: FSMContext) -> None:
             "medals": {"gold": 0, "silver": 0, "bronze": 0},
             # --- состояние текущего сезона ---
             "tactic": None,
+            "tactic_locked": False,
             "consecutive_losses": 0,
             "tactic_consecutive_wins": 0,
+            "queue": [],
+            "carried_attempts": 1,
+            "weekly_percent_modifier": 0,
         }
 
     await state.clear()
@@ -126,3 +130,4 @@ async def process_motto(message: Message, state: FSMContext) -> None:
         f"Девиз: {motto}\n\n"
         "Приглашайте друзей в чат — вступить можно командой /join."
     )
+    await message.answer("🎯 Не забудьте выбрать тактику клана на сезон командой /tactic!")

@@ -105,7 +105,7 @@ async def cb_shop_buy(callback: CallbackQuery, state: FSMContext) -> None:
         effect_text = ""
         if key == "avoid_punishment":
             player["shop"]["avoid_punishment"] = player["shop"].get("avoid_punishment", 0) + 1
-            effect_text = "Готово — сработает автоматически при следующем подрыве на мине."
+            effect_text = "Готово — если вас попробуют исключить из группы голосованием (/votekick), это сработает автоматически и защитит вас 1 раз."
         elif key == "next_win_boost":
             player["shop"]["next_win_boost"] = True
             effect_text = "Готово — ваша следующая победа принесёт x1.5."
@@ -234,8 +234,15 @@ async def cb_votekick(callback: CallbackQuery, bot: Bot) -> None:
         count = len(vote["voters"])
 
         if count >= VOTE_KICK_THRESHOLD:
-            kick_target = (vote["chat_id"], vote["target_id"], vote["target_name"])
-            del db["active_votes"][vote_id]
+            target_player = players.find_player(db, vote["target_id"])
+            shield = target_player.get("shop", {}).get("avoid_punishment", 0) if target_player else 0
+            if shield > 0:
+                target_player["shop"]["avoid_punishment"] -= 1
+                del db["active_votes"][vote_id]
+                shielded = vote["target_name"]
+            else:
+                kick_target = (vote["chat_id"], vote["target_id"], vote["target_name"])
+                del db["active_votes"][vote_id]
 
     if kick_target:
         chat_id, target_id, target_name = kick_target

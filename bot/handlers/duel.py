@@ -3,27 +3,24 @@
 Логика мин-дуэли.
 
 ВАЖНО про экономику очков:
- - ставка дуэли = ВСЕ текущие очки клана на момент выбора количества мин
-   (снимок сохраняется в side["stake"], дальше игра считается по нему,
-   даже если очки клана вдруг изменятся извне за это время);
- - при подрыве на мине: очки ВСЕГО клана умножаются на LOSS_MULTIPLIER (0.75);
- - при "заборе" выигрыша: очки клана НЕ складываются "поверх" ставки (иначе
-   она задвоилась бы), а обновляются:
-       clan.points = clan.points - stake + (stake * multiplier)
-   Так как stake обычно равен всем очкам клана на старте, для типичного
-   случая это эквивалентно простому clan.points = stake * multiplier —
-   но формула через вычитание остаётся корректной и в редких случаях,
-   когда очки клана успели измениться (например, другая параллельная
-   дуэль) между стартом и завершением этой игры.
+ - ставка каждой ПОПЫТКИ = ВСЕ текущие очки клана на момент выбора количества
+   мин для этой попытки (снимок берётся заново для каждой попытки — см.
+   cb_choose_mines — а не один раз на весь вызов);
+ - при подрыве на мине: очки ВСЕГО клана умножаются на эффективный штраф
+   (обычно LOSS_MULTIPLIER=0.75, но тактики могут его менять);
+ - при "заборе" выигрыша: очки клана обновляются как
+       clan.points = clan.points - stake + (stake * multiplier * тактика * недельный_модификатор)
 
-Оба игрока дуэли играют НА СВОИХ ОТДЕЛЬНЫХ ПОЛЯХ параллельно (независимо друг
-от друга) — так задано в ТЗ ("у двух игроков из разных кланов будет разное
-поле"). Понятие "AFK / переход хода" реализовано как таймаут бездействия на
-поле конкретного игрока: если игрок долго не нажимает клетку, его текущий
-прогресс автоматически фиксируется через "забрать очки" (безопасный дефолт).
+ПОПЫТКИ: если игрок клана не сыграл свой вызов вовсе, его попытка переходит
+следующему в очереди с накоплением (bot/turns.py). Столько попыток, сколько
+накопилось, доступны в рамках ОДНОГО вызова подряд — после каждой сыгранной
+попытки, если остались ещё, игроку сразу предлагается выбрать мины заново.
+
+ЗАКРЕПЛЕНИЕ: сообщение-вызов на дуэль закрепляется ботом; как только кто-то
+открывает выбор количества мин, вызов открепляется и закрепляется само меню
+выбора мин; когда дуэль (все попытки обеих сторон) завершена — открепляется.
 """
 
-import time
 from typing import Optional, Tuple
 
 from aiogram import Router, F, Bot
@@ -73,25 +70,27 @@ def _mark_member_played(clan: dict, user_id: int) -> None:
     clan["last_played_at"] = now()
 
 
+async def _unpin_safe(bot: Bot, chat_id, message_id) -> None:
+    if not chat_id or not message_id:
+        return
+    try:
+        await bot.unpin_chat_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
 def _apply_loss(clan: dict, side: dict, player: dict) -> Tuple[float, str, bool, list]:
     """Возвращает (новые_очки, текст_эффекта_привилегии, конвертировано_в_победу, новые_ачивки)."""
     shop = player.setdefault("shop", {"avoid_punishment": 0, "next_win_boost": False, "next_loss_forgiven": False})
 
     if shop.get("next_loss_forgiven"):
         shop["next_loss_forgiven"] = False
-        new_points, won_al, new_ach = _apply_cashout(
+        new_points, won_al, base_al, new_ach = _apply_cashout(
             clan, side, player, 1.0, side["stake"], player["user_id"],
             player.get("username") or player.get("first_name")
         )
         note = "🔵 Привилегия «Поражение не засчитывается» сработала — раунд завершён на x1, без потерь."
         return new_points, note, True, new_ach
-
-    if shop.get("avoid_punishment", 0) > 0:
-        shop["avoid_punishment"] -= 1
-        tactics.register_round_result(clan, won=False)
-        new_ach = players.record_round_result(player, won=False, multiplier=0)
-        note = "📃 Привилегия «Избежать наказания» сработала — очки клана не пострадали."
-        return clan.get("points", 0), note, False, new_ach
 
     mult = tactics.effective_loss_multiplier(clan, side)
     new_points = round(clan.get("points", 0) * mult, 2)
@@ -104,7 +103,8 @@ def _apply_loss(clan: dict, side: dict, player: dict) -> Tuple[float, str, bool,
 
 def _apply_cashout(
     clan: dict, side: dict, player: dict, multiplier: float, stake: int, user_id: int, username: str
-) -> Tuple[float, int, list]:
+) -> Tuple[float, int, int, list]:
+    """Возвращает (новые_очки, выигрыш_с_модификаторами, выигрыш_без_недельного_модификатора, новые_ачивки)."""
     win_mult = tactics.win_points_multiplier(clan, side, player)
 
     shop = player.setdefault("shop", {"avoid_punishment": 0, "next_win_boost": False, "next_loss_forgiven": False})
@@ -112,7 +112,10 @@ def _apply_cashout(
         shop["next_win_boost"] = False
         win_mult *= 1.5
 
-    won_al = round(stake * multiplier * win_mult)
+    base_al = round(stake * multiplier * win_mult)
+    weekly_mult = tactics.weekly_modifier_multiplier(clan)
+    won_al = round(base_al * weekly_mult)
+
     new_points = round(clan.get("points", 0) - stake + won_al, 2)
     clan["points"] = new_points
 
@@ -126,11 +129,16 @@ def _apply_cashout(
     te_gain = round(multiplier * tactics.currency_multiplier(clan, side), 2)
     new_ach = players.record_round_result(player, won=True, multiplier=multiplier, currency_gain=te_gain)
 
-    return new_points, won_al, new_ach
+    return new_points, won_al, base_al, new_ach
+
+
+def _cashout_text_for(clan: dict, multiplier: float, won_al: int, base_al: int, new_points: float) -> str:
+    weekly_pct = clan.get("weekly_percent_modifier", 0)
+    return texts.cashout_text(clan["name"], multiplier, won_al, new_points, weekly_pct, base_al)
 
 
 def _finalize_duel_result(db: dict, duel: dict) -> str:
-    """Вызывается, когда ОБЕ стороны завершили игру. Возвращает текст итога."""
+    """Вызывается, когда ОБЕ стороны исчерпали свои попытки. Возвращает текст итога."""
     side_a, side_b = duel["sides"]["a"], duel["sides"]["b"]
     clan_a = _find_clan(db, side_a["clan_id"])
     clan_b = _find_clan(db, side_b["clan_id"])
@@ -189,7 +197,8 @@ def _find_active_side_for_user(db: dict, user_id: int):
 
 
 @router.message(Command("minduel"))
-async def cmd_minduel(message: Message) -> None:
+async def cmd_minduel(message: Message, bot: Bot) -> None:
+    invite_to_unpin = None
     async with Storage() as db:
         invite = db.get("pending_invite")
         user_is_invited = bool(invite) and message.from_user.id in (
@@ -197,10 +206,6 @@ async def cmd_minduel(message: Message) -> None:
         )
 
         if not user_is_invited:
-            # Возможно, дуэль уже была начата вторым игроком (создаётся сразу для
-            # ОБОИХ при первом /minduel) — тогда этому пользователю не нужно
-            # повторно жать /minduel, нужно просто нажать кнопку выбора мин
-            # или кликать по своему полю выше в чате.
             duel, side_key = _find_active_side_for_user(db, message.from_user.id)
             if duel:
                 side = duel["sides"][side_key]
@@ -243,7 +248,8 @@ async def cmd_minduel(message: Message) -> None:
                     "stage": "choose_mines", "mines_count": None, "mine_positions": [],
                     "opened_cells": [], "current_multiplier": 1.0, "result": None,
                     "multiplier": 0, "chat_id": None, "message_id": None,
-                    "stake": max(round(clan_a.get("points", 0)), config.MIN_STAKE_AL),
+                    "stake": None,
+                    "attempts_total": invite.get("attempts_a", 1), "attempts_used": 0,
                     "last_action_at": now(),
                 },
                 "b": {
@@ -251,13 +257,19 @@ async def cmd_minduel(message: Message) -> None:
                     "stage": "choose_mines", "mines_count": None, "mine_positions": [],
                     "opened_cells": [], "current_multiplier": 1.0, "result": None,
                     "multiplier": 0, "chat_id": None, "message_id": None,
-                    "stake": max(round(clan_b.get("points", 0)), config.MIN_STAKE_AL),
+                    "stake": None,
+                    "attempts_total": invite.get("attempts_b", 1), "attempts_used": 0,
                     "last_action_at": now(),
                 },
             },
+            "pinned_chat_id": None,
+            "pinned_message_id": None,
         }
         db["active_duels"][str(duel_id)] = duel
         db["pending_invite"] = None
+
+        if invite.get("chat_id") and invite.get("message_id"):
+            invite_to_unpin = (invite["chat_id"], invite["message_id"])
 
         rules = texts.duel_rules_text(
             clan_a["name"], clan_a.get("points", 0), clan_b["name"], clan_b.get("points", 0)
@@ -268,8 +280,29 @@ async def cmd_minduel(message: Message) -> None:
         }
         prog_block = texts.mines_progressions_block(progressions)
 
-    text = rules + "\n" + prog_block + texts.choose_mines_prompt()
-    await message.answer(text, parse_mode="HTML", reply_markup=mine_count_kb(duel_id))
+        extra_note = ""
+        max_attempts = max(invite.get("attempts_a", 1), invite.get("attempts_b", 1))
+        if max_attempts > 1:
+            extra_note = (
+                f"\n\n🔁 У кого-то из вызванных накопились пропущенные ходы — "
+                f"в этом вызове доступно до {max_attempts} попыток подряд."
+            )
+
+    if invite_to_unpin:
+        await _unpin_safe(bot, invite_to_unpin[0], invite_to_unpin[1])
+
+    text = rules + "\n" + prog_block + texts.choose_mines_prompt() + extra_note
+    sent = await message.answer(text, parse_mode="HTML", reply_markup=mine_count_kb(duel_id))
+
+    try:
+        await bot.pin_chat_message(sent.chat.id, sent.message_id, disable_notification=True)
+        async with Storage() as db:
+            d = db["active_duels"].get(str(duel_id))
+            if d:
+                d["pinned_chat_id"] = sent.chat.id
+                d["pinned_message_id"] = sent.message_id
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------- выбор кол-ва мин --
@@ -293,26 +326,37 @@ async def cb_choose_mines(callback: CallbackQuery) -> None:
             await callback.answer("Вы уже выбрали количество мин.", show_alert=True)
             return
 
+        clan = _find_clan(db, side["clan_id"])
+
         side["mines_count"] = mines
         side["mine_positions"] = game.generate_mines(mines)
         side["opened_cells"] = []
         side["current_multiplier"] = 1.0
         side["stage"] = "playing"
         side["last_action_at"] = now()
+        # ставка снимается заново на КАЖДУЮ попытку — текущие очки клана на этот момент
+        side["stake"] = max(round(clan.get("points", 0)) if clan else 0, config.MIN_STAKE_AL)
 
-        clan = _find_clan(db, side["clan_id"])
         gamble_note = ""
         if clan and clan.get("tactic") == "gamble":
             effect_key = tactics.roll_gamble_effect()
             side["gamble_effect"] = effect_key
             effect = tactics.GAMBLE_EFFECTS[effect_key]
-            gamble_note = f'\n🎲 Тактика «Азарт»: выпал эффект {effect["emoji"]} <b>{effect["name"]}</b>!'
+            gamble_note = (
+                f'\n🎲 Тактика «Азарт»: выпал эффект {effect["emoji"]} <b>{effect["name"]}</b> '
+                f'— {effect["desc"]}!'
+            )
 
         user = callback.from_user
         players.get_or_create_player(db, user.id, user.username or "", user.first_name or "Игрок")
 
+        attempts_note = ""
+        total = side.get("attempts_total", 1)
+        if total > 1 and side.get("attempts_used", 0) == 0:
+            attempts_note = f"\n🔁 Доступно попыток в этом вызове: {total}"
+
         next_prog = _format_progression(game.progression_list(mines, steps=5, start_from=0))
-        header = texts.board_header(mines, 0, 1.0, next_prog, side["stake"]) + gamble_note
+        header = texts.board_header(mines, 0, 1.0, next_prog, side["stake"]) + gamble_note + attempts_note
 
     name = f"@{user.username}" if user.username else user.first_name
     sent = await callback.message.answer(
@@ -330,14 +374,39 @@ async def cb_choose_mines(callback: CallbackQuery) -> None:
     await callback.answer("Мины расставлены, удачи! 🍀")
 
 
+# -------------------------------------------------- завершение попытки -----
+
+def _finish_attempt(duel: dict, side: dict, side_key: str, db: dict):
+    """После розыгрыша одной попытки: если остались ещё — сбрасывает сторону
+    обратно в 'choose_mines' и возвращает (True, доп_текст). Если попытки
+    исчерпаны — помечает сторону 'done' и возвращает (False, финализация_дуэли)."""
+    side["attempts_used"] = side.get("attempts_used", 0) + 1
+    remaining = side.get("attempts_total", 1) - side["attempts_used"]
+
+    if remaining > 0:
+        side["stage"] = "choose_mines"
+        return True, texts.attempts_remaining_text(remaining)
+
+    side["stage"] = "done"
+    finalize_text = None
+    pinned = None
+    other = duel["sides"][_other_side(side_key)]
+    if other["stage"] == "done":
+        finalize_text = _finalize_duel_result(db, duel)
+        pinned = (duel.get("pinned_chat_id"), duel.get("pinned_message_id"))
+        del db["active_duels"][str(duel["id"])]
+    return False, (finalize_text, pinned)
+
+
 # ------------------------------------------------------------- клик поля ---
 
 @router.callback_query(F.data.startswith("duel:cell:"))
-async def cb_cell(callback: CallbackQuery) -> None:
+async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
     _, _, duel_id_s, idx_s = callback.data.split(":")
     duel_id, idx = int(duel_id_s), int(idx_s)
 
     finalize_text = None
+    pinned_to_unpin = None
     async with Storage() as db:
         duel = db["active_duels"].get(str(duel_id))
         if not duel:
@@ -362,26 +431,32 @@ async def cb_cell(callback: CallbackQuery) -> None:
         player = players.get_or_create_player(db, user.id, user.username or "", user.first_name or "Игрок")
 
         new_achievements = []
+        more_attempts_note = ""
         if idx in side["mine_positions"]:
+            old_points = clan.get("points", 0)
+            possible_multiplier = side["current_multiplier"] if side["opened_cells"] else 1.0
+            possible_al = round(side["stake"] * possible_multiplier)
+
             side["opened_cells"].append(idx)
             new_points, effect_note, converted_to_win, new_achievements = _apply_loss(clan, side, player)
             if converted_to_win:
-                side["stage"] = "done"
                 side["result"] = "win"
                 side["multiplier"] = 1.0
-                text = effect_note + "\n\n" + texts.cashout_text(clan["name"], 1.0, round(side["stake"]), new_points)
+                text = effect_note + "\n\n" + _cashout_text_for(clan, 1.0, round(side["stake"]), round(side["stake"]), new_points)
                 kb = None
             else:
-                side["stage"] = "done"
                 side["result"] = "loss"
-                text = texts.lose_text(clan["name"], new_points)
+                text = texts.lose_text(clan["name"], old_points, new_points, possible_multiplier, possible_al)
                 if effect_note:
                     text = effect_note + "\n\n" + text
                 kb = board_kb(duel_id, side["opened_cells"], exploded=True)
-            other = duel["sides"][_other_side(side_key)]
-            if other["stage"] == "done":
-                finalize_text = _finalize_duel_result(db, duel)
-                del db["active_duels"][str(duel_id)]
+
+            has_more, extra = _finish_attempt(duel, side, side_key, db)
+            if has_more:
+                more_attempts_note = "\n\n" + extra
+                kb = mine_count_kb(duel_id)
+            else:
+                finalize_text, pinned_to_unpin = extra
         else:
             side["opened_cells"].append(idx)
             opened_count = len(side["opened_cells"])
@@ -390,22 +465,23 @@ async def cb_cell(callback: CallbackQuery) -> None:
 
             max_possible = config.TOTAL_CELLS - mines
             if opened_count >= max_possible:
-                # все безопасные клетки открыты — авто-забор выигрыша
-                new_points, won_al, new_achievements = _apply_cashout(
+                new_points, won_al, base_al, new_achievements = _apply_cashout(
                     clan, side, player, side["current_multiplier"], side["stake"],
                     user.id, user.username or user.first_name
                 )
-                side["stage"] = "done"
                 side["result"] = "win"
                 text = (
                     "🌟 Все безопасные клетки открыты! Автоматически забираем выигрыш.\n\n"
-                    + texts.cashout_text(clan["name"], side["current_multiplier"], won_al, new_points)
+                    + _cashout_text_for(clan, side["current_multiplier"], won_al, base_al, new_points)
                 )
                 kb = None
-                other = duel["sides"][_other_side(side_key)]
-                if other["stage"] == "done":
-                    finalize_text = _finalize_duel_result(db, duel)
-                    del db["active_duels"][str(duel_id)]
+
+                has_more, extra = _finish_attempt(duel, side, side_key, db)
+                if has_more:
+                    more_attempts_note = "\n\n" + extra
+                    kb = mine_count_kb(duel_id)
+                else:
+                    finalize_text, pinned_to_unpin = extra
             else:
                 next_prog = _format_progression(
                     game.progression_list(mines, steps=5, start_from=opened_count)
@@ -416,7 +492,7 @@ async def cb_cell(callback: CallbackQuery) -> None:
                 kb = board_kb(duel_id, side["opened_cells"])
 
     try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        await callback.message.edit_text(text + more_attempts_note, parse_mode="HTML", reply_markup=kb)
     except Exception:
         pass
     await callback.answer()
@@ -432,15 +508,19 @@ async def cb_cell(callback: CallbackQuery) -> None:
             await callback.message.answer(finalize_text, parse_mode="HTML")
         except Exception:
             pass
+    if pinned_to_unpin:
+        await _unpin_safe(bot, pinned_to_unpin[0], pinned_to_unpin[1])
 
 
 # --------------------------------------------------------------- cashout ---
 
 @router.callback_query(F.data.startswith("duel:cashout:"))
-async def cb_cashout(callback: CallbackQuery) -> None:
+async def cb_cashout(callback: CallbackQuery, bot: Bot) -> None:
     duel_id = int(callback.data.split(":")[2])
 
     finalize_text = None
+    pinned_to_unpin = None
+    more_attempts_note = ""
     async with Storage() as db:
         duel = db["active_duels"].get(str(duel_id))
         if not duel:
@@ -459,22 +539,24 @@ async def cb_cashout(callback: CallbackQuery) -> None:
         user = callback.from_user
         player = players.get_or_create_player(db, user.id, user.username or "", user.first_name or "Игрок")
         multiplier = side["current_multiplier"] if side["opened_cells"] else 1.0
-        new_points, won_al, new_achievements = _apply_cashout(
+        new_points, won_al, base_al, new_achievements = _apply_cashout(
             clan, side, player, multiplier, side["stake"], user.id, user.username or user.first_name
         )
-        side["stage"] = "done"
         side["result"] = "win"
         side["multiplier"] = multiplier
 
-        text = texts.cashout_text(clan["name"], multiplier, won_al, new_points)
+        text = _cashout_text_for(clan, multiplier, won_al, base_al, new_points)
 
-        other = duel["sides"][_other_side(side_key)]
-        if other["stage"] == "done":
-            finalize_text = _finalize_duel_result(db, duel)
-            del db["active_duels"][str(duel_id)]
+        has_more, extra = _finish_attempt(duel, side, side_key, db)
+        kb = None
+        if has_more:
+            more_attempts_note = "\n\n" + extra
+            kb = mine_count_kb(duel_id)
+        else:
+            finalize_text, pinned_to_unpin = extra
 
     try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=None)
+        await callback.message.edit_text(text + more_attempts_note, parse_mode="HTML", reply_markup=kb)
     except Exception:
         pass
     await callback.answer("Очки зафиксированы!")
@@ -490,6 +572,8 @@ async def cb_cashout(callback: CallbackQuery) -> None:
             await callback.message.answer(finalize_text, parse_mode="HTML")
         except Exception:
             pass
+    if pinned_to_unpin:
+        await _unpin_safe(bot, pinned_to_unpin[0], pinned_to_unpin[1])
 
 
 # ------------------------------------------------------------ AFK-хранитель
@@ -507,7 +591,7 @@ async def afk_watcher_loop(bot: Bot) -> None:
 
 
 async def _check_afk_once(bot: Bot) -> None:
-    to_notify = []  # (chat_id, message_id, text, kb, finalize_text)
+    to_notify = []  # (chat_id, message_id, text, kb, finalize_text, pinned_to_unpin)
 
     async with Storage() as db:
         for duel_id_s, duel in list(db["active_duels"].items()):
@@ -531,33 +615,36 @@ async def _check_afk_once(bot: Bot) -> None:
                     db, side["player_id"], member.get("username", ""), member.get("first_name", "Игрок")
                 )
 
-                new_points, won_al, new_achievements = _apply_cashout(
+                new_points, won_al, base_al, new_achievements = _apply_cashout(
                     clan, side, player, multiplier, side["stake"], side["player_id"], username
                 )
-                side["stage"] = "done"
                 side["result"] = "win"
                 side["multiplier"] = multiplier
 
                 text = (
                     texts.afk_autocashout_text(f"@{username}" if member.get("username") else username)
                     + "\n\n"
-                    + texts.cashout_text(clan["name"], multiplier, won_al, new_points)
+                    + _cashout_text_for(clan, multiplier, won_al, base_al, new_points)
                 )
                 if new_achievements:
                     text += "\n\n" + texts.new_achievements_text(new_achievements)
 
+                has_more, extra = _finish_attempt(duel, side, side_key, db)
                 finalize_text = None
-                other = duel["sides"][_other_side(side_key)]
-                if other["stage"] == "done":
-                    finalize_text = _finalize_duel_result(db, duel)
-                    del db["active_duels"][str(duel_id_s)]
+                pinned_to_unpin = None
+                kb = None
+                if has_more:
+                    text += "\n\n" + extra
+                    kb = mine_count_kb(int(duel_id_s))
+                else:
+                    finalize_text, pinned_to_unpin = extra
 
-                to_notify.append((side["chat_id"], side["message_id"], text, finalize_text))
+                to_notify.append((side["chat_id"], side["message_id"], text, kb, finalize_text, pinned_to_unpin))
 
-    for chat_id, message_id, text, finalize_text in to_notify:
+    for chat_id, message_id, text, kb, finalize_text, pinned_to_unpin in to_notify:
         try:
             await bot.edit_message_text(
-                chat_id=chat_id, message_id=message_id, text=text, parse_mode="HTML"
+                chat_id=chat_id, message_id=message_id, text=text, parse_mode="HTML", reply_markup=kb
             )
         except Exception:
             pass
@@ -566,3 +653,5 @@ async def _check_afk_once(bot: Bot) -> None:
                 await bot.send_message(chat_id, finalize_text, parse_mode="HTML")
             except Exception:
                 pass
+        if pinned_to_unpin:
+            await _unpin_safe(bot, pinned_to_unpin[0], pinned_to_unpin[1])

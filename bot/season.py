@@ -3,13 +3,17 @@
 Сезон войны кланов.
 
  - Сезон длится config.SEASON_LENGTH_DAYS (30) дней, завершается автоматически:
-   итоги (топ + победитель) публикуются в боевой чат, очки/серии/победы/тактика
-   сбрасываются, а УРОВЕНЬ/ОПЫТ/РЕПУТАЦИЯ/ДОСТИЖЕНИЯ/ИСТОРИЯ КЛАНА — НЕТ,
-   они копятся из сезона в сезон.
- - Каждые 7 дней сезона очки всех кланов "сжимаются" к среднему на 10%
-   (см. CONVERGENCE_FACTOR), кроме кланов с тактикой "Тихо не спеша" — для них
-   действует не общая формула, а фиксированные -4% (если выше среднего) /
-   +6% (если ниже среднего).
+   итоги (топ + победитель) публикуются в боевой чат, очки/серии/победы/тактика/
+   недельный модификатор сбрасываются, а УРОВЕНЬ/ОПЫТ/РЕПУТАЦИЯ/ДОСТИЖЕНИЯ/
+   ИСТОРИЯ КЛАНА — НЕТ, они копятся из сезона в сезон. В конце сезона бот
+   также напоминает всем владельцам кланов выбрать тактику на новый сезон.
+ - Каждые 7 дней сезона каждый клан получает +-% (по месту в рейтинге) к
+   ОЧКАМ, ПОЛУЧАЕМЫМ В РАУНДАХ МИН (не трогает текущий баланс клана напрямую).
+   Этот %% НАКАПЛИВАЕТСЯ неделя к неделе (складывается, может уйти в 0 или
+   поменять знак, если ранг клана изменился). Топ получает -10%, аутсайдер
+   +10%, промежуточные места — линейно между ними (чем больше кланов, тем
+   мельче шаг). Тактика "Тихо не спеша" заменяет это на фиксированные +-6%
+   для клана, который её выбрал.
  - Репутация клана обнуляется в начале каждого календарного года (сам клан,
    уровень и достижения — нет, это отдельная система).
 """
@@ -61,8 +65,8 @@ def _check_clan_achievements(clan: dict, rank: int, total_clans: int) -> list:
 
 def finalize_season_locked(db: dict) -> str:
     """Подводит итоги сезона: опыт/уровни/репутация/медали/достижения кланов,
-    затем сбрасывает очки/серии/тактики сезона. Вызывать ТОЛЬКО внутри
-    `async with Storage() as db:`."""
+    затем сбрасывает очки/серии/тактики/недельный модификатор сезона.
+    Вызывать ТОЛЬКО внутри `async with Storage() as db:`."""
     clans = list(db["clans"].values())
     for clan in clans:
         ensure_clan_fields(clan)
@@ -125,16 +129,23 @@ def finalize_season_locked(db: dict) -> str:
         clan["wars_won"] = 0
         clan["best_single_multiplier"] = None
         clan["tactic"] = None
+        clan["tactic_locked"] = False
         clan["consecutive_losses"] = 0
         clan["tactic_consecutive_wins"] = 0
+        clan["weekly_percent_modifier"] = 0
 
     if achievement_lines:
         final_text += "\n\n🏆 <b>Новые достижения кланов:</b>\n" + "\n".join(achievement_lines)
 
+    final_text += (
+        "\n\n🎯 <b>Владельцы кланов!</b> Не забудьте выбрать тактику клана на "
+        "новый сезон командой /tactic — сменить её потом до конца сезона будет нельзя."
+    )
+
     db["pending_invite"] = None
     db["active_duels"] = {}
     db["season_started_at"] = now()
-    db["last_convergence_at"] = now()
+    db["last_weekly_modifier_at"] = now()
     return final_text
 
 
@@ -146,7 +157,7 @@ async def _check_and_finalize(bot: Bot) -> None:
         started = db.get("season_started_at")
         if started is None:
             db["season_started_at"] = now()
-            db["last_convergence_at"] = now()
+            db["last_weekly_modifier_at"] = now()
             return
 
         elapsed_days = (now() - started) / 86400
@@ -167,59 +178,83 @@ async def _check_and_finalize(bot: Bot) -> None:
             pass
 
 
-# --------------------------------------------------- еженедельное сжатие ---
+# ------------------------------------------- еженедельный баф/дебафф очков -
 
-def _apply_weekly_convergence_locked(db: dict) -> str:
+def _rank_based_percent(rank_index: int, total: int) -> float:
+    """rank_index: 0 = топ, total-1 = аутсайдер. Линейная растяжка -10%..+10%."""
+    if total <= 1:
+        return 0.0
+    span = config.WEEKLY_MODIFIER_MAX_PERCENT * 2
+    return -config.WEEKLY_MODIFIER_MAX_PERCENT + (rank_index / (total - 1)) * span
+
+
+def _apply_weekly_modifier_locked(db: dict) -> str:
+    """Каждые 7 дней происходят ДВА РАЗНЫХ события:
+    1) сжатие текущих очков клана к среднему по всем кланам (10%);
+    2) отдельно — накопительный %-бонус/штраф к БУДУЩИМ очкам из раундов мин,
+       зависящий от места в рейтинге (или от тактики "Тихо не спеша")."""
     clans = list(db["clans"].values())
     for clan in clans:
         ensure_clan_fields(clan)
     if len(clans) < 2:
         return ""
 
-    mean_points = sum(c.get("points", 0) for c in clans) / len(clans)
-    lines = ["🧲 <b>Еженедельное сжатие очков войны!</b>", ""]
+    # ранжируем ДО каких-либо изменений — по текущим очкам
+    clans_sorted = sorted(clans, key=lambda c: c.get("points", 0), reverse=True)
+    total = len(clans_sorted)
+    mean_points = sum(c.get("points", 0) for c in clans) / total
 
-    for clan in clans:
+    lines = ["🧲 <b>Еженедельное событие войны кланов!</b>", ""]
+
+    for rank_index, clan in enumerate(clans_sorted):
+        # --- 1) сжатие очков к среднему ---
         old_points = clan.get("points", 0)
-        if clan.get("tactic") == "quiet":
-            if old_points > mean_points:
-                new_points = old_points * 0.96
-            elif old_points < mean_points:
-                new_points = old_points * 1.06
-            else:
-                new_points = old_points
-        else:
-            new_points = old_points + (mean_points - old_points) * config.CONVERGENCE_FACTOR
-        new_points = round(new_points, 2)
+        new_points = round(old_points + (mean_points - old_points) * config.CONVERGENCE_FACTOR, 2)
         clan["points"] = new_points
-        delta = new_points - old_points
-        sign = "+" if delta >= 0 else ""
-        lines.append(f"«{clan['name']}»: {old_points:g} → {new_points:g} ({sign}{delta:.1f})")
+        points_delta = new_points - old_points
+        pts_sign = "+" if points_delta >= 0 else ""
+
+        # --- 2) накопительный %-бонус к будущим очкам ---
+        if clan.get("tactic") == "quiet":
+            delta_pct = -config.QUIET_TACTIC_PERCENT if rank_index < total / 2 else config.QUIET_TACTIC_PERCENT
+        else:
+            delta_pct = _rank_based_percent(rank_index, total)
+
+        old_mod = clan.get("weekly_percent_modifier", 0)
+        new_mod = round(old_mod + delta_pct, 1)
+        clan["weekly_percent_modifier"] = new_mod
+        pct_sign = "+" if delta_pct >= 0 else ""
+        total_pct_sign = "+" if new_mod >= 0 else ""
+
+        lines.append(
+            f"«{clan['name']}»: очки {old_points:g} → {new_points:g} ({pts_sign}{points_delta:.1f}) | "
+            f"бонус к будущим очкам {pct_sign}{delta_pct:.0f}% → итого {total_pct_sign}{new_mod:g}%"
+        )
 
     return "\n".join(lines)
 
 
-async def _check_weekly_convergence(bot: Bot) -> None:
+async def _check_weekly_modifier(bot: Bot) -> None:
     text = None
     group_id = None
 
     async with Storage() as db:
         season_started = db.get("season_started_at")
-        last_conv = db.get("last_convergence_at") or season_started
-        if season_started is None or last_conv is None:
+        last_mod = db.get("last_weekly_modifier_at") or season_started
+        if season_started is None or last_mod is None:
             return
 
-        elapsed_since_last = (now() - last_conv) / 86400
-        if elapsed_since_last < config.CONVERGENCE_INTERVAL_DAYS:
+        elapsed_since_last = (now() - last_mod) / 86400
+        if elapsed_since_last < config.WEEKLY_MODIFIER_INTERVAL_DAYS:
             return
 
         if not db["clans"]:
-            db["last_convergence_at"] = now()
+            db["last_weekly_modifier_at"] = now()
             return
 
         group_id = db.get("group_chat_id")
-        text = _apply_weekly_convergence_locked(db)
-        db["last_convergence_at"] = now()
+        text = _apply_weekly_modifier_locked(db)
+        db["last_weekly_modifier_at"] = now()
 
     if text and group_id:
         try:
@@ -266,7 +301,7 @@ async def season_watcher_loop(bot: Bot) -> None:
     while True:
         try:
             await _check_and_finalize(bot)
-            await _check_weekly_convergence(bot)
+            await _check_weekly_modifier(bot)
             await _check_yearly_reputation_reset(bot)
         except Exception:
             pass

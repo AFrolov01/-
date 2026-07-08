@@ -12,8 +12,10 @@ from bot.handlers import clan_create, clan_join, clan_info, clan_manage, tactics
 from bot.matchmaking import scheduler_loop
 from bot.handlers.duel import afk_watcher_loop
 from bot.season import season_watcher_loop
+from bot.turns import turn_watcher_loop
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("main")
 
 
 async def _set_commands(bot: Bot) -> None:
@@ -35,6 +37,14 @@ async def _set_commands(bot: Bot) -> None:
 
 
 async def main() -> None:
+    logger.info("=" * 60)
+    logger.info("Файл базы данных: %s", config.DATA_FILE)
+    logger.info(
+        "Если после деплоя кланы/очки пропадают — проверьте, что этот путь "
+        "совпадает с Mount Path подключённого Railway Volume."
+    )
+    logger.info("=" * 60)
+
     bot = Bot(
         token=config.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -55,6 +65,7 @@ async def main() -> None:
     asyncio.create_task(scheduler_loop(bot))
     asyncio.create_task(afk_watcher_loop(bot))
     asyncio.create_task(season_watcher_loop(bot))
+    asyncio.create_task(turn_watcher_loop(bot))
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
