@@ -67,12 +67,13 @@ def board_header(mines: int, opened: int, current_multiplier: float, next_progre
     return header
 
 
-def lose_text(clan_name: str, old_points: float, new_points: float, possible_multiplier: float, possible_al: int) -> str:
+def lose_text(clan_name: str, old_points: float, new_points: float, possible_multiplier: float, possible_al: int, applied_mult: float) -> str:
+    deducted = round(old_points - new_points, 2)
     return (
         "💥 <b>Бум! Вы подорвались на мине.</b>\n"
         f"Если бы забрали сейчас: x{possible_multiplier:.2f}".replace(".", ",") + f" ({possible_al} Al)\n"
         f"Очки клана «{clan_name}» до мины: <b>{old_points:g}</b>\n"
-        f"Очки умножены на {LOSS_MULTIPLIER}.\n"
+        f"Очки умножены на {applied_mult:g} (списано {deducted:g} очков).\n"
         f"Новые очки клана: <b>{new_points:g}</b>"
     )
 

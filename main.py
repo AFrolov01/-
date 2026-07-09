@@ -43,6 +43,15 @@ async def main() -> None:
         "Если после деплоя кланы/очки пропадают — проверьте, что этот путь "
         "совпадает с Mount Path подключённого Railway Volume."
     )
+    try:
+        from bot.storage import read_only
+        db = await read_only()
+        logger.info(
+            "При старте загружено кланов: %d, игроков: %d",
+            len(db.get("clans", {})), len(db.get("players", {}))
+        )
+    except Exception as e:
+        logger.error("НЕ УДАЛОСЬ прочитать файл базы данных при старте: %s", e)
     logger.info("=" * 60)
 
     bot = Bot(

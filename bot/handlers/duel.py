@@ -79,8 +79,8 @@ async def _unpin_safe(bot: Bot, chat_id, message_id) -> None:
         pass
 
 
-def _apply_loss(clan: dict, side: dict, player: dict) -> Tuple[float, str, bool, list]:
-    """Возвращает (новые_очки, текст_эффекта_привилегии, конвертировано_в_победу, новые_ачивки)."""
+def _apply_loss(clan: dict, side: dict, player: dict) -> Tuple[float, str, bool, list, float]:
+    """Возвращает (новые_очки, текст_эффекта_привилегии, конвертировано_в_победу, новые_ачивки, применённый_множитель)."""
     shop = player.setdefault("shop", {"avoid_punishment": 0, "next_win_boost": False, "next_loss_forgiven": False})
 
     if shop.get("next_loss_forgiven"):
@@ -90,7 +90,7 @@ def _apply_loss(clan: dict, side: dict, player: dict) -> Tuple[float, str, bool,
             player.get("username") or player.get("first_name")
         )
         note = "🔵 Привилегия «Поражение не засчитывается» сработала — раунд завершён на x1, без потерь."
-        return new_points, note, True, new_ach
+        return new_points, note, True, new_ach, 1.0
 
     mult = tactics.effective_loss_multiplier(clan, side)
     new_points = round(clan.get("points", 0) * mult, 2)
@@ -98,7 +98,7 @@ def _apply_loss(clan: dict, side: dict, player: dict) -> Tuple[float, str, bool,
     clan["current_win_streak"] = 0
     tactics.register_round_result(clan, won=False)
     new_ach = players.record_round_result(player, won=False, multiplier=0)
-    return new_points, "", False, new_ach
+    return new_points, "", False, new_ach, mult
 
 
 def _apply_cashout(
@@ -438,7 +438,7 @@ async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
             possible_al = round(side["stake"] * possible_multiplier)
 
             side["opened_cells"].append(idx)
-            new_points, effect_note, converted_to_win, new_achievements = _apply_loss(clan, side, player)
+            new_points, effect_note, converted_to_win, new_achievements, applied_mult = _apply_loss(clan, side, player)
             if converted_to_win:
                 side["result"] = "win"
                 side["multiplier"] = 1.0
@@ -446,7 +446,7 @@ async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
                 kb = None
             else:
                 side["result"] = "loss"
-                text = texts.lose_text(clan["name"], old_points, new_points, possible_multiplier, possible_al)
+                text = texts.lose_text(clan["name"], old_points, new_points, possible_multiplier, possible_al, applied_mult)
                 if effect_note:
                     text = effect_note + "\n\n" + text
                 kb = board_kb(duel_id, side["opened_cells"], exploded=True)

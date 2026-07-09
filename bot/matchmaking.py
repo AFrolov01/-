@@ -29,6 +29,7 @@ import config
 from bot.storage import Storage, now
 from bot import texts
 from bot.clan_utils import ensure_clan_fields
+from bot.turns import force_expire_before_new_duel
 
 
 def _pick_member(clan: dict) -> Optional[dict]:
@@ -87,6 +88,11 @@ def pick_duel_pair(db: dict) -> Optional[Tuple[dict, dict, dict, dict]]:
 async def announce_duel(bot: Bot) -> Tuple[bool, str]:
     """Возвращает (успех, причина/описание) — удобно и для планировщика, и для
     ручного вызова админом командой /forceduel из ЛС бота."""
+    # сначала принудительно закрываем любые старые незавершённые вызовы/дуэли —
+    # переносим их попытки следующим в очереди и открепляем старые сообщения,
+    # чтобы не путать "чьи это накопленные попытки" и не плодить закреплённые дубли
+    await force_expire_before_new_duel(bot)
+
     async with Storage() as db:
         group_id = db.get("group_chat_id")
         if not group_id:

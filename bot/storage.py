@@ -46,11 +46,13 @@
 import json
 import os
 import asyncio
+import logging
 import time
 from typing import Any, Dict, Optional
 
 from config import DATA_FILE
 
+logger = logging.getLogger("storage")
 _lock = asyncio.Lock()
 
 _DEFAULT_DB: Dict[str, Any] = {
@@ -80,7 +82,13 @@ def _read() -> Dict[str, Any]:
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         try:
             data = json.load(f)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            logger.error(
+                "ФАЙЛ БАЗЫ ДАННЫХ ПОВРЕЖДЁН (%s) — %s. Сбрасываю в состояние по "
+                "умолчанию (кланы будут потеряны!). Проверьте, не запущено ли "
+                "два экземпляра бота одновременно с одним и тем же файлом.",
+                DATA_FILE, e,
+            )
             data = dict(_DEFAULT_DB)
     # подстрахуемся от отсутствующих ключей (например, после обновления схемы)
     for key, value in _DEFAULT_DB.items():
@@ -90,9 +98,13 @@ def _read() -> Dict[str, Any]:
 
 def _write(data: Dict[str, Any]) -> None:
     tmp_path = DATA_FILE + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, DATA_FILE)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, DATA_FILE)
+    except Exception as e:
+        logger.error("НЕ УДАЛОСЬ записать файл базы данных %s: %s", DATA_FILE, e)
+        raise
 
 
 class Storage:

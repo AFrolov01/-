@@ -29,13 +29,13 @@ def _skip_note_for(clan: dict, player_id: int) -> str:
     return f"{name} не пришёл(а) на дуэль⛔ Переход хода следующему."
 
 
-async def _expire_pending_invite(bot: Bot) -> None:
+async def _expire_pending_invite(bot: Bot, force: bool = False) -> None:
     to_unpin = None
     async with Storage() as db:
         invite = db.get("pending_invite")
         if not invite:
             return
-        if now() - invite.get("created_at", now()) < config.TURN_TIMEOUT_HOURS * 3600:
+        if not force and now() - invite.get("created_at", now()) < config.TURN_TIMEOUT_HOURS * 3600:
             return
 
         notes = db.setdefault("pending_skip_notes", [])
@@ -57,17 +57,18 @@ async def _expire_pending_invite(bot: Bot) -> None:
             pass
 
 
-async def _expire_stuck_duel_sides(bot: Bot) -> None:
+async def _expire_stuck_duel_sides(bot: Bot, force: bool = False) -> None:
     notifications = []  # (chat_id, text)
     to_unpin = []
 
     async with Storage() as db:
         for duel_id, duel in list(db["active_duels"].items()):
+            touched = False
             for side_key in ("a", "b"):
                 side = duel["sides"][side_key]
                 if side["stage"] != "choose_mines":
                     continue
-                if now() - side.get("last_action_at", 0) < config.TURN_TIMEOUT_HOURS * 3600:
+                if not force and now() - side.get("last_action_at", 0) < config.TURN_TIMEOUT_HOURS * 3600:
                     continue
 
                 clan = db["clans"].get(str(side["clan_id"]))
@@ -78,6 +79,10 @@ async def _expire_stuck_duel_sides(bot: Bot) -> None:
 
                 side["stage"] = "done"
                 side["result"] = None  # не сыграл — не победа и не поражение
+                touched = True
+
+            if not touched:
+                continue
 
             other_a, other_b = duel["sides"]["a"], duel["sides"]["b"]
             if other_a["stage"] == "done" and other_b["stage"] == "done":
@@ -89,6 +94,14 @@ async def _expire_stuck_duel_sides(bot: Bot) -> None:
                 if duel.get("pinned_chat_id") and duel.get("pinned_message_id"):
                     to_unpin.append((duel["pinned_chat_id"], duel["pinned_message_id"]))
                 del db["active_duels"][duel_id]
+            elif force:
+                # хотя бы одна сторона всё ещё "choose_mines"/"playing" не по таймауту —
+                # но раз мы форсируем перед новой дуэлью, всё равно открепляем старое
+                # сообщение этой дуэли, чтобы не копились закреплённые дубли
+                if duel.get("pinned_chat_id") and duel.get("pinned_message_id"):
+                    to_unpin.append((duel["pinned_chat_id"], duel["pinned_message_id"]))
+                duel["pinned_chat_id"] = None
+                duel["pinned_message_id"] = None
 
     for chat_id, text in notifications:
         try:
@@ -100,6 +113,15 @@ async def _expire_stuck_duel_sides(bot: Bot) -> None:
             await bot.unpin_chat_message(chat_id, message_id)
         except Exception:
             pass
+
+
+async def force_expire_before_new_duel(bot: Bot) -> None:
+    """Вызывается ПЕРЕД объявлением новой дуэли: принудительно (без ожидания
+    таймаута) закрывает все незавершённые старые вызовы/дуэли — переносит их
+    попытки следующим в очереди и открепляет старые закреплённые сообщения,
+    чтобы не копились дубли и не путались "чьи это 2 попытки"."""
+    await _expire_pending_invite(bot, force=True)
+    await _expire_stuck_duel_sides(bot, force=True)
 
 
 async def turn_watcher_loop(bot: Bot) -> None:
