@@ -31,8 +31,8 @@ RULES_TEXT = (
     "начинается заново с момента пополнения.\n\n"
     "<b>Команды:</b>\n"
     "/bank — эти правила + текущий баланс\n"
-    "/bank deposit СУММА — положить Те на вклад\n"
-    "/bank withdraw СУММА — снять Те (если срок удержания уже прошёл)"
+    "/bank депозит СУММА — положить Те на вклад\n"
+    "/bank вывести СУММА — снять Те (если срок удержания уже прошёл)"
 )
 
 
@@ -61,7 +61,7 @@ async def cmd_bank(message: Message) -> None:
             return
 
         action = parts[1].lower()
-        if action not in ("deposit", "withdraw") or len(parts) < 3:
+        if action not in ("ltgjpbn", "вывести") or len(parts) < 3:
             await message.reply("Используйте: /bank deposit СУММА или /bank withdraw СУММА")
             return
 
@@ -76,7 +76,7 @@ async def cmd_bank(message: Message) -> None:
 
         bank = player.setdefault("bank", {"balance": 0.0, "deposited_at": None})
 
-        if action == "deposit":
+        if action == "депозит":
             if player.get("currency", 0.0) < amount:
                 await message.reply(f"Недостаточно Те на руках (есть {player.get('currency', 0):.2f}).")
                 return
