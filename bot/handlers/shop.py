@@ -123,6 +123,25 @@ async def cb_shop_buy(callback: CallbackQuery, state: FSMContext) -> None:
                 ensure_clan_fields(clan)
                 clan["points"] = round(clan.get("points", 0) * 1.1, 2)
             effect_text = "Готово — ваша дуэль завершена, очки клана x1.1."
+        elif key == "noob_dice":
+            player["shop"]["noob_dice_rounds"] = config.NOOB_DICE_ROUNDS
+            effect_text = (
+                f"Готово — на ваши следующие {config.NOOB_DICE_ROUNDS} раунда(ов) на поле "
+                "появится клетка-портал (как в тактике «Вращайте барабан»). Если тактика "
+                "клана уже «Вращайте барабан» — у вас будет сразу 2 портала. Раунд "
+                "считается использованным, даже если портал не найден."
+            )
+        elif key == "grapes":
+            player["shop"]["grapes_rounds"] = config.GRAPES_ROUNDS
+            effect_text = (
+                f"Готово — на ваши следующие {config.GRAPES_ROUNDS} раунда(ов): если ваш "
+                f"выигрышный множитель окажется меньше x{config.GRAPES_MIN_MULTIPLIER}, "
+                f"с шансом {int(config.GRAPES_SUCCESS_CHANCE * 100)}% он поднимется до "
+                f"x{config.GRAPES_MIN_MULTIPLIER}, а иначе — минус "
+                f"{int(config.GRAPES_FAIL_PENALTY * 100)}% от выигранных очков. При "
+                "подрыве на мине эффект не срабатывает, но раунд всё равно считается "
+                "использованным."
+            )
         elif key in ("rename_clan", "rename_group"):
             effect_text = "Напишите новое название следующим сообщением."
 

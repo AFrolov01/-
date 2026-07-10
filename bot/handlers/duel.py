@@ -2,25 +2,42 @@
 """
 Логика мин-дуэли.
 
+ПОРЯДОК ПРИМЕНЕНИЯ БОНУСОВ К ВЫИГРЫШУ (важно, фиксированный порядок):
+ 1. Базовое поле (x из прогрессии мин)
+ 2. Усиление портала (тактика/предмет "Вращайте барабан", x1.5 за каждый портал,
+    накопительно) — шаги 1+2 вместе дают side["current_multiplier"]
+ 3. % тактики клана (например тактика "Да да нет нет" +10% за серию побед) —
+    ТОЛЬКО к выигранным очкам этого раунда, не трогает баланс клана напрямую
+ 4. % недельного модификатора (накопительный ранговый баф/дебафф)
+ 5. Личные предметы игрока (например "Сливы, виноград") — применяются САМЫМИ
+    ПОСЛЕДНИМИ, после того как уже посчитаны шаги 1-4
+
 ВАЖНО про экономику очков:
  - ставка каждой ПОПЫТКИ = ВСЕ текущие очки клана на момент выбора количества
-   мин для этой попытки (снимок берётся заново для каждой попытки — см.
-   cb_choose_mines — а не один раз на весь вызов);
- - при подрыве на мине: очки ВСЕГО клана умножаются на эффективный штраф
-   (обычно LOSS_MULTIPLIER=0.75, но тактики могут его менять);
- - при "заборе" выигрыша: очки клана обновляются как
-       clan.points = clan.points - stake + (stake * multiplier * тактика * недельный_модификатор)
+   мин для этой попытки (снимок берётся заново для каждой попытки);
+ - при подрыве на мине: очки клана умножаются на эффективный штраф (обычно
+   LOSS_MULTIPLIER=0.75, тактики могут его менять).
+
+ПОРТАЛ: если у клана тактика "Вращайте барабан" и/или у игрока активен купленный
+"Кубик-нубика" — на поле есть 1 (или 2, если активны оба) клетка-портал. Клик по
+ней полностью сбрасывает текущий раунд (множитель сгорает), поле генерируется
+заново с тем же числом мин, а ВСЕ множители умножаются на PORTAL_MULTIPLIER_STEP
+(накопительно). Переходов не ограничено, попытка при этом не расходуется.
+
+ПРОЗРАЧНОСТЬ: после того как раунд завершён (победа или поражение), бот
+присылает отдельным сообщением поле с открытыми настоящими позициями мин (🔴)
+и порталов (🌀), чтобы было видно, что реально было на поле.
 
 ПОПЫТКИ: если игрок клана не сыграл свой вызов вовсе, его попытка переходит
 следующему в очереди с накоплением (bot/turns.py). Столько попыток, сколько
-накопилось, доступны в рамках ОДНОГО вызова подряд — после каждой сыгранной
-попытки, если остались ещё, игроку сразу предлагается выбрать мины заново.
+накопилось, доступны в рамках ОДНОГО вызова подряд.
 
 ЗАКРЕПЛЕНИЕ: сообщение-вызов на дуэль закрепляется ботом; как только кто-то
 открывает выбор количества мин, вызов открепляется и закрепляется само меню
 выбора мин; когда дуэль (все попытки обеих сторон) завершена — открепляется.
 """
 
+import random
 from typing import Optional, Tuple
 
 from aiogram import Router, F, Bot
@@ -31,7 +48,7 @@ import config
 from bot.storage import Storage, now
 from bot import texts, game, players, tactics
 from bot.clan_utils import ensure_clan_fields
-from bot.keyboards import mine_count_kb, board_kb
+from bot.keyboards import mine_count_kb, board_kb, board_revealed_kb
 
 router = Router(name="duel")
 
@@ -79,13 +96,20 @@ async def _unpin_safe(bot: Bot, chat_id, message_id) -> None:
         pass
 
 
+def _default_shop() -> dict:
+    return {
+        "avoid_punishment": 0, "next_win_boost": False, "next_loss_forgiven": False,
+        "noob_dice_rounds": 0, "grapes_rounds": 0,
+    }
+
+
 def _apply_loss(clan: dict, side: dict, player: dict) -> Tuple[float, str, bool, list, float]:
     """Возвращает (новые_очки, текст_эффекта_привилегии, конвертировано_в_победу, новые_ачивки, применённый_множитель)."""
-    shop = player.setdefault("shop", {"avoid_punishment": 0, "next_win_boost": False, "next_loss_forgiven": False})
+    shop = player.setdefault("shop", _default_shop())
 
     if shop.get("next_loss_forgiven"):
         shop["next_loss_forgiven"] = False
-        new_points, won_al, base_al, new_ach = _apply_cashout(
+        new_points, won_al, base_al, new_ach, _grapes_note = _apply_cashout(
             clan, side, player, 1.0, side["stake"], player["user_id"],
             player.get("username") or player.get("first_name")
         )
@@ -103,19 +127,44 @@ def _apply_loss(clan: dict, side: dict, player: dict) -> Tuple[float, str, bool,
 
 def _apply_cashout(
     clan: dict, side: dict, player: dict, multiplier: float, stake: int, user_id: int, username: str
-) -> Tuple[float, int, int, list]:
-    """Возвращает (новые_очки, выигрыш_с_модификаторами, выигрыш_без_недельного_модификатора, новые_ачивки)."""
-    win_mult = tactics.win_points_multiplier(clan, side, player)
+) -> Tuple[float, int, int, list, str]:
+    """Возвращает (новые_очки, выигрыш_с_модификаторами, выигрыш_до_недельного_модификатора, новые_ачивки, заметка_о_личном_предмете).
+    `multiplier` уже включает шаги 1+2 (поле + усиление портала)."""
+    shop = player.setdefault("shop", _default_shop())
 
-    shop = player.setdefault("shop", {"avoid_punishment": 0, "next_win_boost": False, "next_loss_forgiven": False})
+    # шаг 3: % тактики клана (+ next_win_boost как временный аналогичный бонус)
+    tactic_mult = tactics.win_points_multiplier(clan, side, player)
     if shop.get("next_win_boost"):
         shop["next_win_boost"] = False
-        win_mult *= 1.5
+        tactic_mult *= 1.5
+    after_tactic = stake * multiplier * tactic_mult
+    base_al = round(after_tactic)
 
-    base_al = round(stake * multiplier * win_mult)
+    # шаг 4: недельный модификатор
     weekly_mult = tactics.weekly_modifier_multiplier(clan)
-    won_al = round(base_al * weekly_mult)
+    after_weekly = after_tactic * weekly_mult
 
+    # шаг 5: личные предметы ("Сливы, виноград") — применяются последними
+    grapes_note = ""
+    final_amount = after_weekly
+    if shop.get("grapes_rounds", 0) > 0:
+        eff_x = (after_weekly / stake) if stake else 0
+        if eff_x < config.GRAPES_MIN_MULTIPLIER:
+            if random.random() < config.GRAPES_SUCCESS_CHANCE:
+                final_amount = stake * config.GRAPES_MIN_MULTIPLIER
+                grapes_note = (
+                    f"🍇 «Сливы, виноград» сработали! Выигрыш поднят до "
+                    f"x{config.GRAPES_MIN_MULTIPLIER} ({round(final_amount)} Al)."
+                )
+            else:
+                final_amount = after_weekly * (1 - config.GRAPES_FAIL_PENALTY)
+                grapes_note = (
+                    f"🍇 «Сливы, виноград» — не повезло: "
+                    f"-{int(config.GRAPES_FAIL_PENALTY * 100)}% от выигрыша "
+                    f"({round(final_amount)} Al вместо {round(after_weekly)})."
+                )
+
+    won_al = round(final_amount)
     new_points = round(clan.get("points", 0) - stake + won_al, 2)
     clan["points"] = new_points
 
@@ -129,12 +178,12 @@ def _apply_cashout(
     te_gain = round(multiplier * tactics.currency_multiplier(clan, side), 2)
     new_ach = players.record_round_result(player, won=True, multiplier=multiplier, currency_gain=te_gain)
 
-    return new_points, won_al, base_al, new_ach
+    return new_points, won_al, base_al, new_ach, grapes_note
 
 
-def _cashout_text_for(clan: dict, multiplier: float, won_al: int, base_al: int, new_points: float) -> str:
+def _cashout_text_for(clan: dict, multiplier: float, won_al: int, base_al: int, new_points: float, grapes_note: str = "") -> str:
     weekly_pct = clan.get("weekly_percent_modifier", 0)
-    return texts.cashout_text(clan["name"], multiplier, won_al, new_points, weekly_pct, base_al)
+    return texts.cashout_text(clan["name"], multiplier, won_al, new_points, weekly_pct, base_al, grapes_note)
 
 
 def _finalize_duel_result(db: dict, duel: dict) -> str:
@@ -186,6 +235,13 @@ def _finalize_duel_result(db: dict, duel: dict) -> str:
     )
 
 
+def _revealed_kb_for(side: dict, exploded_cell=None):
+    return board_revealed_kb(
+        side.get("opened_cells", []), side.get("mine_positions", []),
+        side.get("portal_positions", []), exploded_cell,
+    )
+
+
 # ------------------------------------------------------------- /minduel ----
 
 def _find_active_side_for_user(db: dict, user_id: int):
@@ -194,6 +250,20 @@ def _find_active_side_for_user(db: dict, user_id: int):
         if side_key:
             return duel, side_key
     return None, None
+
+
+def _new_side(player_id: int, attempts_total: int) -> dict:
+    return {
+        "player_id": player_id,
+        "stage": "choose_mines", "mines_count": None,
+        "mine_positions": [], "portal_positions": [], "portals_count": 0,
+        "field_boost": 1.0, "portal_triggered_this_round": False,
+        "opened_cells": [], "current_multiplier": 1.0, "result": None,
+        "multiplier": 0, "chat_id": None, "message_id": None,
+        "stake": None,
+        "attempts_total": attempts_total, "attempts_used": 0,
+        "last_action_at": now(),
+    }
 
 
 @router.message(Command("minduel"))
@@ -243,24 +313,8 @@ async def cmd_minduel(message: Message, bot: Bot) -> None:
         duel = {
             "id": duel_id,
             "sides": {
-                "a": {
-                    "clan_id": clan_a["id"], "player_id": invite["player_a_id"],
-                    "stage": "choose_mines", "mines_count": None, "mine_positions": [],
-                    "opened_cells": [], "current_multiplier": 1.0, "result": None,
-                    "multiplier": 0, "chat_id": None, "message_id": None,
-                    "stake": None,
-                    "attempts_total": invite.get("attempts_a", 1), "attempts_used": 0,
-                    "last_action_at": now(),
-                },
-                "b": {
-                    "clan_id": clan_b["id"], "player_id": invite["player_b_id"],
-                    "stage": "choose_mines", "mines_count": None, "mine_positions": [],
-                    "opened_cells": [], "current_multiplier": 1.0, "result": None,
-                    "multiplier": 0, "chat_id": None, "message_id": None,
-                    "stake": None,
-                    "attempts_total": invite.get("attempts_b", 1), "attempts_used": 0,
-                    "last_action_at": now(),
-                },
+                "a": {**_new_side(invite["player_a_id"], invite.get("attempts_a", 1)), "clan_id": clan_a["id"]},
+                "b": {**_new_side(invite["player_b_id"], invite.get("attempts_b", 1)), "clan_id": clan_b["id"]},
             },
             "pinned_chat_id": None,
             "pinned_message_id": None,
@@ -327,9 +381,18 @@ async def cb_choose_mines(callback: CallbackQuery) -> None:
             return
 
         clan = _find_clan(db, side["clan_id"])
+        user = callback.from_user
+        player = players.get_or_create_player(db, user.id, user.username or "", user.first_name or "Игрок")
+
+        portals_count = players.portals_count_for(clan, player)
+        mine_positions, portal_positions = game.generate_field(mines, portals_count)
 
         side["mines_count"] = mines
-        side["mine_positions"] = game.generate_mines(mines)
+        side["mine_positions"] = mine_positions
+        side["portal_positions"] = portal_positions
+        side["portals_count"] = portals_count
+        side["field_boost"] = 1.0
+        side["portal_triggered_this_round"] = False
         side["opened_cells"] = []
         side["current_multiplier"] = 1.0
         side["stage"] = "playing"
@@ -347,8 +410,9 @@ async def cb_choose_mines(callback: CallbackQuery) -> None:
                 f'— {effect["desc"]}!'
             )
 
-        user = callback.from_user
-        players.get_or_create_player(db, user.id, user.username or "", user.first_name or "Игрок")
+        portal_note = ""
+        if portals_count > 0:
+            portal_note = f"\n🌀 На поле спрятан{'ы' if portals_count > 1 else ''} {portals_count} портал{'а' if portals_count > 1 else ''}!"
 
         attempts_note = ""
         total = side.get("attempts_total", 1)
@@ -356,7 +420,7 @@ async def cb_choose_mines(callback: CallbackQuery) -> None:
             attempts_note = f"\n🔁 Доступно попыток в этом вызове: {total}"
 
         next_prog = _format_progression(game.progression_list(mines, steps=5, start_from=0))
-        header = texts.board_header(mines, 0, 1.0, next_prog, side["stake"]) + gamble_note + attempts_note
+        header = texts.board_header(mines, 0, 1.0, next_prog, side["stake"]) + gamble_note + portal_note + attempts_note
 
     name = f"@{user.username}" if user.username else user.first_name
     sent = await callback.message.answer(
@@ -400,6 +464,11 @@ def _finish_attempt(duel: dict, side: dict, side_key: str, db: dict):
 
 # ------------------------------------------------------------- клик поля ---
 
+@router.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("duel:cell:"))
 async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
     _, _, duel_id_s, idx_s = callback.data.split(":")
@@ -407,6 +476,8 @@ async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
 
     finalize_text = None
     pinned_to_unpin = None
+    reveal_kb = None
+    item_notes = []
     async with Storage() as db:
         duel = db["active_duels"].get(str(duel_id))
         if not duel:
@@ -432,7 +503,31 @@ async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
 
         new_achievements = []
         more_attempts_note = ""
-        if idx in side["mine_positions"]:
+
+        if idx in side.get("portal_positions", []):
+            # --- ПОРТАЛ: сброс поля, множитель сгорает, усиление растёт ---
+            old_multiplier = side["current_multiplier"] if side["opened_cells"] else 1.0
+            side["field_boost"] = round(side.get("field_boost", 1.0) * config.PORTAL_MULTIPLIER_STEP, 4)
+            side["portal_triggered_this_round"] = True
+
+            mine_positions, portal_positions = game.generate_field(mines, side.get("portals_count", 0))
+            side["mine_positions"] = mine_positions
+            side["portal_positions"] = portal_positions
+            side["opened_cells"] = []
+            side["current_multiplier"] = game.multiplier_for(mines, 0, side["field_boost"])
+            side["multiplier"] = side["current_multiplier"]
+
+            next_prog = _format_progression(
+                game.progression_list(mines, steps=5, start_from=0, boost=side["field_boost"])
+            )
+            text = (
+                texts.portal_text(old_multiplier, side["field_boost"]) + "\n\n"
+                + texts.board_header(mines, 0, side["current_multiplier"], next_prog, side["stake"], side["field_boost"])
+            )
+            kb = board_kb(duel_id, [])
+            # попытка НЕ расходуется — раунд продолжается на новом поле
+
+        elif idx in side["mine_positions"]:
             old_points = clan.get("points", 0)
             possible_multiplier = side["current_multiplier"] if side["opened_cells"] else 1.0
             possible_al = round(side["stake"] * possible_multiplier)
@@ -451,6 +546,9 @@ async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
                     text = effect_note + "\n\n" + text
                 kb = board_kb(duel_id, side["opened_cells"], exploded=True)
 
+            reveal_kb = _revealed_kb_for(side, exploded_cell=idx)
+            item_notes = players.tick_temporary_items(player, side.get("portal_triggered_this_round", False))
+
             has_more, extra = _finish_attempt(duel, side, side_key, db)
             if has_more:
                 more_attempts_note = "\n\n" + extra
@@ -460,21 +558,24 @@ async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
         else:
             side["opened_cells"].append(idx)
             opened_count = len(side["opened_cells"])
-            side["current_multiplier"] = game.multiplier_for(mines, opened_count)
+            side["current_multiplier"] = game.multiplier_for(mines, opened_count, side.get("field_boost", 1.0))
             side["multiplier"] = side["current_multiplier"]
 
-            max_possible = config.TOTAL_CELLS - mines
+            max_possible = config.TOTAL_CELLS - mines - len(side.get("portal_positions", []))
             if opened_count >= max_possible:
-                new_points, won_al, base_al, new_achievements = _apply_cashout(
+                new_points, won_al, base_al, new_achievements, grapes_note = _apply_cashout(
                     clan, side, player, side["current_multiplier"], side["stake"],
                     user.id, user.username or user.first_name
                 )
                 side["result"] = "win"
                 text = (
                     "🌟 Все безопасные клетки открыты! Автоматически забираем выигрыш.\n\n"
-                    + _cashout_text_for(clan, side["current_multiplier"], won_al, base_al, new_points)
+                    + _cashout_text_for(clan, side["current_multiplier"], won_al, base_al, new_points, grapes_note)
                 )
                 kb = None
+
+                reveal_kb = _revealed_kb_for(side)
+                item_notes = players.tick_temporary_items(player, side.get("portal_triggered_this_round", False))
 
                 has_more, extra = _finish_attempt(duel, side, side_key, db)
                 if has_more:
@@ -484,10 +585,10 @@ async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
                     finalize_text, pinned_to_unpin = extra
             else:
                 next_prog = _format_progression(
-                    game.progression_list(mines, steps=5, start_from=opened_count)
+                    game.progression_list(mines, steps=5, start_from=opened_count, boost=side.get("field_boost", 1.0))
                 )
                 text = texts.board_header(
-                    mines, opened_count, side["current_multiplier"], next_prog, side["stake"]
+                    mines, opened_count, side["current_multiplier"], next_prog, side["stake"], side.get("field_boost", 1.0)
                 )
                 kb = board_kb(duel_id, side["opened_cells"])
 
@@ -497,12 +598,21 @@ async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
         pass
     await callback.answer()
 
+    if reveal_kb:
+        try:
+            await callback.message.answer("🔍 <b>Вот как было устроено поле:</b>", parse_mode="HTML", reply_markup=reveal_kb)
+        except Exception:
+            pass
+    if item_notes:
+        try:
+            await callback.message.answer("\n".join(item_notes))
+        except Exception:
+            pass
     if new_achievements:
         try:
             await callback.message.answer(texts.new_achievements_text(new_achievements), parse_mode="HTML")
         except Exception:
             pass
-
     if finalize_text:
         try:
             await callback.message.answer(finalize_text, parse_mode="HTML")
@@ -539,13 +649,15 @@ async def cb_cashout(callback: CallbackQuery, bot: Bot) -> None:
         user = callback.from_user
         player = players.get_or_create_player(db, user.id, user.username or "", user.first_name or "Игрок")
         multiplier = side["current_multiplier"] if side["opened_cells"] else 1.0
-        new_points, won_al, base_al, new_achievements = _apply_cashout(
+        new_points, won_al, base_al, new_achievements, grapes_note = _apply_cashout(
             clan, side, player, multiplier, side["stake"], user.id, user.username or user.first_name
         )
         side["result"] = "win"
         side["multiplier"] = multiplier
 
-        text = _cashout_text_for(clan, multiplier, won_al, base_al, new_points)
+        text = _cashout_text_for(clan, multiplier, won_al, base_al, new_points, grapes_note)
+        reveal_kb = _revealed_kb_for(side)
+        item_notes = players.tick_temporary_items(player, side.get("portal_triggered_this_round", False))
 
         has_more, extra = _finish_attempt(duel, side, side_key, db)
         kb = None
@@ -561,12 +673,21 @@ async def cb_cashout(callback: CallbackQuery, bot: Bot) -> None:
         pass
     await callback.answer("Очки зафиксированы!")
 
+    if reveal_kb:
+        try:
+            await callback.message.answer("🔍 <b>Вот как было устроено поле:</b>", parse_mode="HTML", reply_markup=reveal_kb)
+        except Exception:
+            pass
+    if item_notes:
+        try:
+            await callback.message.answer("\n".join(item_notes))
+        except Exception:
+            pass
     if new_achievements:
         try:
             await callback.message.answer(texts.new_achievements_text(new_achievements), parse_mode="HTML")
         except Exception:
             pass
-
     if finalize_text:
         try:
             await callback.message.answer(finalize_text, parse_mode="HTML")
@@ -591,7 +712,7 @@ async def afk_watcher_loop(bot: Bot) -> None:
 
 
 async def _check_afk_once(bot: Bot) -> None:
-    to_notify = []  # (chat_id, message_id, text, kb, finalize_text, pinned_to_unpin)
+    to_notify = []  # (chat_id, message_id, text, kb, finalize_text, pinned_to_unpin, reveal_kb)
 
     async with Storage() as db:
         for duel_id_s, duel in list(db["active_duels"].items()):
@@ -615,7 +736,7 @@ async def _check_afk_once(bot: Bot) -> None:
                     db, side["player_id"], member.get("username", ""), member.get("first_name", "Игрок")
                 )
 
-                new_points, won_al, base_al, new_achievements = _apply_cashout(
+                new_points, won_al, base_al, new_achievements, grapes_note = _apply_cashout(
                     clan, side, player, multiplier, side["stake"], side["player_id"], username
                 )
                 side["result"] = "win"
@@ -624,10 +745,14 @@ async def _check_afk_once(bot: Bot) -> None:
                 text = (
                     texts.afk_autocashout_text(f"@{username}" if member.get("username") else username)
                     + "\n\n"
-                    + _cashout_text_for(clan, multiplier, won_al, base_al, new_points)
+                    + _cashout_text_for(clan, multiplier, won_al, base_al, new_points, grapes_note)
                 )
                 if new_achievements:
                     text += "\n\n" + texts.new_achievements_text(new_achievements)
+
+                item_notes = players.tick_temporary_items(player, side.get("portal_triggered_this_round", False))
+                if item_notes:
+                    text += "\n\n" + "\n".join(item_notes)
 
                 has_more, extra = _finish_attempt(duel, side, side_key, db)
                 finalize_text = None
@@ -639,15 +764,21 @@ async def _check_afk_once(bot: Bot) -> None:
                 else:
                     finalize_text, pinned_to_unpin = extra
 
-                to_notify.append((side["chat_id"], side["message_id"], text, kb, finalize_text, pinned_to_unpin))
+                reveal_kb = _revealed_kb_for(side)
+                to_notify.append((side["chat_id"], side["message_id"], text, kb, finalize_text, pinned_to_unpin, reveal_kb))
 
-    for chat_id, message_id, text, kb, finalize_text, pinned_to_unpin in to_notify:
+    for chat_id, message_id, text, kb, finalize_text, pinned_to_unpin, reveal_kb in to_notify:
         try:
             await bot.edit_message_text(
                 chat_id=chat_id, message_id=message_id, text=text, parse_mode="HTML", reply_markup=kb
             )
         except Exception:
             pass
+        if reveal_kb:
+            try:
+                await bot.send_message(chat_id, "🔍 <b>Вот как было устроено поле:</b>", parse_mode="HTML", reply_markup=reveal_kb)
+            except Exception:
+                pass
         if finalize_text:
             try:
                 await bot.send_message(chat_id, finalize_text, parse_mode="HTML")

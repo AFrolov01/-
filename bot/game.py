@@ -7,21 +7,22 @@
 """
 
 import random
-from typing import List
+from typing import List, Tuple
 
 from config import TOTAL_CELLS, HOUSE_EDGE
 
 
-def multiplier_for(mines: int, opened_safe_cells: int) -> float:
+def multiplier_for(mines: int, opened_safe_cells: int, boost: float = 1.0) -> float:
     """
     Множитель после того, как открыто `opened_safe_cells` безопасных клеток подряд,
-    при заданном количестве мин на поле (25 клеток всего).
+    при заданном количестве мин на поле (25 клеток всего). `boost` — усиление поля
+    от тактики/предмета "Вращайте барабан" (1.0 = без усиления).
 
     Формула — классическая для игр типа "Mines": произведение обратных вероятностей
     вытянуть безопасную клетку на каждом шаге, домноженное на HOUSE_EDGE.
     """
     if opened_safe_cells <= 0:
-        return 1.0
+        return round(1.0 * boost, 2)
     result = 1.0
     for i in range(opened_safe_cells):
         remaining_total = TOTAL_CELLS - i
@@ -30,10 +31,10 @@ def multiplier_for(mines: int, opened_safe_cells: int) -> float:
             # физически невозможно (все безопасные клетки уже открыты) — вернём последнее валидное значение
             break
         result *= remaining_total / remaining_safe
-    return round(result * HOUSE_EDGE, 2)
+    return round(result * HOUSE_EDGE * boost, 2)
 
 
-def progression_list(mines: int, steps: int = 5, start_from: int = 0) -> List[float]:
+def progression_list(mines: int, steps: int = 5, start_from: int = 0, boost: float = 1.0) -> List[float]:
     """
     Список следующих `steps` множителей начиная с (start_from+1)-й открытой клетки.
     Используется для отображения "следующий множитель: x1.70 -> x2.30 -> ...".
@@ -43,7 +44,7 @@ def progression_list(mines: int, steps: int = 5, start_from: int = 0) -> List[fl
     for k in range(start_from + 1, start_from + 1 + steps):
         if k > max_possible:
             break
-        result.append(multiplier_for(mines, k))
+        result.append(multiplier_for(mines, k, boost))
     return result
 
 
@@ -54,6 +55,14 @@ def format_progression(values: List[float]) -> str:
 def generate_mines(mines_count: int) -> List[int]:
     """Возвращает список индексов клеток (0..24), где спрятаны мины."""
     return random.sample(range(TOTAL_CELLS), mines_count)
+
+
+def generate_field(mines_count: int, portals_count: int = 0) -> Tuple[List[int], List[int]]:
+    """Возвращает (мины, порталы) — непересекающиеся позиции на поле 5х5."""
+    all_positions = random.sample(range(TOTAL_CELLS), mines_count + portals_count)
+    mines = all_positions[:mines_count]
+    portals = all_positions[mines_count:]
+    return mines, portals
 
 
 def cell_to_rc(index: int) -> str:

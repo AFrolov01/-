@@ -241,6 +241,20 @@ async def cmd_clan(message: Message) -> None:
         f"🥇 x{medals.get('gold', 0)}  🥈 x{medals.get('silver', 0)}  🥉 x{medals.get('bronze', 0)}\n\n"
         f"👥 <b>Участники ({len(members)}):</b>\n" + "\n".join(members_lines)
     )
+
+    avatar = clan.get("avatar_file_id")
+    if avatar:
+        try:
+            if len(text) <= 1024:
+                await message.answer_photo(avatar, caption=text, parse_mode="HTML")
+            else:
+                # подпись к фото в Telegram ограничена 1024 символами — если карточка
+                # длиннее (например, у клана очень много участников), шлём отдельно
+                await message.answer_photo(avatar)
+                await message.answer(text, parse_mode="HTML")
+            return
+        except Exception:
+            pass  # если фото вдруг недоступно — отправим просто текстом ниже
     await message.reply(text, parse_mode="HTML")
 
 

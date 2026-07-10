@@ -15,8 +15,11 @@
       "avoid_punishment": int,       # сколько раз доступно
       "next_win_boost": bool,
       "next_loss_forgiven": bool,
+      "noob_dice_rounds": int,       # "Кубик-нубика" — осталось раундов с порталом
+      "grapes_rounds": int,          # "Сливы, виноград" — осталось раундов эффекта
   },
   "purchases_count": int,
+  "bank": {"balance": float, "deposited_at": float | None},
 }
 """
 
@@ -26,6 +29,19 @@ from typing import Optional
 import config
 
 RECENT_WINDOW_SECONDS = 30 * 86400
+
+_SHOP_DEFAULTS = {
+    "avoid_punishment": 0, "next_win_boost": False, "next_loss_forgiven": False,
+    "noob_dice_rounds": 0, "grapes_rounds": 0,
+}
+
+
+def _ensure_player_fields(player: dict) -> dict:
+    shop = player.setdefault("shop", {})
+    for key, default in _SHOP_DEFAULTS.items():
+        shop.setdefault(key, default)
+    player.setdefault("bank", {"balance": 0.0, "deposited_at": None})
+    return player
 
 
 def get_or_create_player(db: dict, user_id: int, username: str = "", first_name: str = "Игрок") -> dict:
@@ -43,8 +59,9 @@ def get_or_create_player(db: dict, user_id: int, username: str = "", first_name:
             "all_time_mult_sum": 0.0, "all_time_mult_count": 0,
             "recent_multipliers": [],
             "achievements": [],
-            "shop": {"avoid_punishment": 0, "next_win_boost": False, "next_loss_forgiven": False},
+            "shop": dict(_SHOP_DEFAULTS),
             "purchases_count": 0,
+            "bank": {"balance": 0.0, "deposited_at": None},
         }
         players[uid] = player
     else:
@@ -53,11 +70,15 @@ def get_or_create_player(db: dict, user_id: int, username: str = "", first_name:
             player["username"] = username
         if first_name:
             player["first_name"] = first_name
+        _ensure_player_fields(player)
     return player
 
 
 def find_player(db: dict, user_id: int) -> Optional[dict]:
-    return db.get("players", {}).get(str(user_id))
+    player = db.get("players", {}).get(str(user_id))
+    if player:
+        _ensure_player_fields(player)
+    return player
 
 
 def record_round_result(player: dict, won: bool, multiplier: float, currency_gain: Optional[float] = None) -> list:
@@ -96,7 +117,62 @@ def record_round_result(player: dict, won: bool, multiplier: float, currency_gai
     return new_achievements
 
 
-def average_multiplier_all_time(player: dict) -> float:
+def tick_temporary_items(player: dict, portal_used_this_round: bool) -> list:
+    """Вызывается ОДИН РАЗ после каждого завершённого раунда (победа/поражение —
+    не важно). Списывает по 1 использованию с временных предметов, если они
+    активны, и возвращает список строк для показа игроку."""
+    notes = []
+    shop = player.setdefault("shop", {})
+
+    dice_left = shop.get("noob_dice_rounds", 0)
+    if dice_left > 0:
+        dice_left -= 1
+        shop["noob_dice_rounds"] = dice_left
+        if portal_used_this_round:
+            notes.append(f"🎲 «Кубик-нубика»: осталось раундов — {dice_left}")
+        else:
+            notes.append(f"🎲 «Кубик-нубика»: портал не найден, сгорает попытка — осталось раундов {dice_left}")
+
+    grapes_left = shop.get("grapes_rounds", 0)
+    if grapes_left > 0:
+        grapes_left -= 1
+        shop["grapes_rounds"] = grapes_left
+        notes.append(f"🍇 «Сливы, виноград»: осталось использований — {grapes_left}")
+
+    return notes
+
+
+def portals_count_for(clan: dict, player: dict) -> int:
+    """Сколько клеток-порталов должно быть на поле игрока в этом раунде."""
+    count = 0
+    if clan and clan.get("tactic") == "barrel":
+        count += 1
+    if player.get("shop", {}).get("noob_dice_rounds", 0) > 0:
+        count += 1
+    return count
+
+
+# ------------------------------------------------------------------ банк ---
+
+def bank_current_balance(player: dict) -> float:
+    """Текущий баланс вклада с учётом сложных процентов, накопленных со дня внесения."""
+    bank = player.get("bank", {"balance": 0.0, "deposited_at": None})
+    balance = bank.get("balance", 0.0)
+    deposited_at = bank.get("deposited_at")
+    if not balance or not deposited_at:
+        return round(balance, 2)
+    days_passed = (time.time() - deposited_at) / 86400
+    grown = balance * ((1 + config.BANK_DAILY_RATE) ** days_passed)
+    return round(grown, 2)
+
+
+def bank_days_left_to_withdraw(player: dict) -> float:
+    bank = player.get("bank", {})
+    deposited_at = bank.get("deposited_at")
+    if not deposited_at:
+        return 0.0
+    elapsed_days = (time.time() - deposited_at) / 86400
+    return max(0.0, config.BANK_MIN_HOLD_DAYS - elapsed_days)
     count = player.get("all_time_mult_count", 0)
     if not count:
         return 0.0

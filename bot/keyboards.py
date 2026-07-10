@@ -30,6 +30,42 @@ def board_kb(duel_id: int, opened_cells: list, exploded: bool = False) -> Inline
     return builder.as_markup()
 
 
+def board_kb(duel_id: int, opened_cells: list, exploded: bool = False) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    total = GRID_SIZE * GRID_SIZE
+    for i in range(total):
+        if i in opened_cells:
+            text = "💥" if (exploded and i == opened_cells[-1]) else "✅"
+        else:
+            text = "❓"
+        builder.button(text=text, callback_data=f"duel:cell:{duel_id}:{i}")
+    builder.adjust(GRID_SIZE)
+    if not exploded:
+        builder.row(InlineKeyboardButton(text="✅ Забрать очки", callback_data=f"duel:cashout:{duel_id}"))
+    return builder.as_markup()
+
+
+def board_revealed_kb(opened_cells: list, mine_positions: list, portal_positions: list, exploded_cell=None) -> InlineKeyboardMarkup:
+    """Прозрачность: показывает, где реально были мины и клетки-порталы, после
+    того как раунд закончен. Кнопки декоративные (некликабельны, noop)."""
+    builder = InlineKeyboardBuilder()
+    total = GRID_SIZE * GRID_SIZE
+    for i in range(total):
+        if i == exploded_cell:
+            text = "💥"
+        elif i in mine_positions:
+            text = "🔴"
+        elif i in portal_positions:
+            text = "🌀"
+        elif i in opened_cells:
+            text = "✅"
+        else:
+            text = "⬜"
+        builder.button(text=text, callback_data="noop")
+    builder.adjust(GRID_SIZE)
+    return builder.as_markup()
+
+
 def clan_carousel_kb(index: int, total: int, clan_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(

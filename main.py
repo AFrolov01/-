@@ -8,7 +8,7 @@ from aiogram.enums import ParseMode
 from aiogram.types import BotCommand
 
 import config
-from bot.handlers import clan_create, clan_join, clan_info, clan_manage, tactics, shop, duel, player_profile
+from bot.handlers import clan_create, clan_join, clan_info, clan_manage, tactics, shop, bank, duel, player_profile
 from bot.matchmaking import scheduler_loop
 from bot.handlers.duel import afk_watcher_loop
 from bot.season import season_watcher_loop
@@ -21,6 +21,7 @@ logger = logging.getLogger("main")
 async def _set_commands(bot: Bot) -> None:
     await bot.set_my_commands([
         BotCommand(command="start", description="Как пользоваться ботом"),
+        BotCommand(command="help", description="Подробный гайд по всем механикам"),
         BotCommand(command="createclan", description="Создать клан"),
         BotCommand(command="join", description="Вступить в клан"),
         BotCommand(command="clan", description="Информация о моём клане"),
@@ -29,6 +30,7 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="deleteclan", description="Расформировать клан (создатель)"),
         BotCommand(command="tactic", description="Выбрать тактику клана на сезон"),
         BotCommand(command="shop", description="Магазин привилегий за Те"),
+        BotCommand(command="bank", description="Банк — вклад валюты Те под процент"),
         BotCommand(command="iam", description="Мой профиль"),
         BotCommand(command="top", description="Топ кланов и игроков"),
         BotCommand(command="season", description="Сколько дней осталось до конца сезона"),
@@ -66,6 +68,7 @@ async def main() -> None:
     dp.include_router(clan_manage.router)
     dp.include_router(tactics.router)
     dp.include_router(shop.router)
+    dp.include_router(bank.router)
     dp.include_router(duel.router)
     dp.include_router(player_profile.router)  # последним: ловит свободные текстовые триггеры
 

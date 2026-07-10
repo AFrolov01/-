@@ -51,12 +51,14 @@ def choose_mines_prompt() -> str:
     )
 
 
-def board_header(mines: int, opened: int, current_multiplier: float, next_progression: str, stake_al: int) -> str:
+def board_header(mines: int, opened: int, current_multiplier: float, next_progression: str, stake_al: int, boost: float = 1.0) -> str:
     win_al = round(stake_al * current_multiplier)
     header = (
         f"💣 Мин: {mines}\n"
         f"💸 Ставка: {stake_al} Al\n"
     )
+    if boost != 1.0:
+        header += f"🌀 Усиление поля: x{boost:.2f}".replace(".", ",") + "\n"
     if opened == 0:
         header += "📊 Откройте первую клетку!\n\n"
     else:
@@ -65,6 +67,13 @@ def board_header(mines: int, opened: int, current_multiplier: float, next_progre
         )
     header += "<blockquote>🧮 Следующий множитель:\n" + next_progression + "</blockquote>"
     return header
+
+
+def portal_text(old_multiplier: float, new_boost: float) -> str:
+    return (
+        f"🌀 <b>Портал!</b> Множитель x{old_multiplier:.2f}".replace(".", ",") + " полностью сгорает.\n"
+        f"Новое поле! Усиление поля теперь: x{new_boost:.2f}".replace(".", ",")
+    )
 
 
 def lose_text(clan_name: str, old_points: float, new_points: float, possible_multiplier: float, possible_al: int, applied_mult: float) -> str:
@@ -78,7 +87,7 @@ def lose_text(clan_name: str, old_points: float, new_points: float, possible_mul
     )
 
 
-def cashout_text(clan_name: str, multiplier: float, won_al: int, new_points: float, weekly_pct: int = 0, base_al: int = None) -> str:
+def cashout_text(clan_name: str, multiplier: float, won_al: int, new_points: float, weekly_pct: int = 0, base_al: int = None, grapes_note: str = "") -> str:
     text = (
         "✅ <b>Вы забрали выигрыш!</b>\n"
         f"Множитель: x{multiplier:.2f}".replace(".", ",") + f" ({won_al} Al)\n"
@@ -91,6 +100,8 @@ def cashout_text(clan_name: str, multiplier: float, won_al: int, new_points: flo
             f"📉 Недельный {'бафф' if weekly_pct > 0 else 'дебафф'} клана: {sign}{weekly_pct}% "
             f"→ без него было бы {base_al} Al ({diff_sign}{diff} Al)\n"
         )
+    if grapes_note:
+        text += grapes_note + "\n"
     text += f"Очки клана «{clan_name}» обновлены: <b>{new_points:g}</b>"
     return text
 
