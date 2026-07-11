@@ -24,6 +24,7 @@ import config
 from bot.storage import Storage, now
 from bot import players
 from bot.clan_utils import ensure_clan_fields
+from bot.fsm_utils import check_command_escape
 
 router = Router(name="shop")
 
@@ -80,7 +81,7 @@ async def cb_shop_buy(callback: CallbackQuery, state: FSMContext) -> None:
             )
             return
 
-        # для покупок, требующих активной дуэли, проверяем ДО списания валюты
+        # для покупок, требующих активной дуэли или проверки прав, проверяем ДО списания валюты
         duel, side_key = None, None
         if key == "forfeit_duel_bonus":
             for d in db["active_duels"].values():
@@ -91,6 +92,17 @@ async def cb_shop_buy(callback: CallbackQuery, state: FSMContext) -> None:
                         duel, side_key = d, sk
             if not duel:
                 await callback.answer("У вас сейчас нет активной дуэли, которую можно завершить.", show_alert=True)
+                return
+        elif key == "change_tactic":
+            buyer_clan = _find_user_clan(db, callback.from_user.id)
+            if not buyer_clan:
+                await callback.answer("Вы не состоите ни в одном клане.", show_alert=True)
+                return
+            if buyer_clan["creator_id"] != callback.from_user.id:
+                await callback.answer("Сменить тактику может только создатель клана.", show_alert=True)
+                return
+            if not buyer_clan.get("tactic_locked"):
+                await callback.answer("Тактика вашего клана и так ещё не заблокирована — просто используйте /tactic.", show_alert=True)
                 return
 
         player["currency"] = round(player["currency"] - price, 2)
@@ -142,6 +154,9 @@ async def cb_shop_buy(callback: CallbackQuery, state: FSMContext) -> None:
                 "подрыве на мине эффект не срабатывает, но раунд всё равно считается "
                 "использованным."
             )
+        elif key == "change_tactic":
+            buyer_clan["tactic_locked"] = False
+            effect_text = "Готово — блокировка снята, используйте /tactic, чтобы выбрать новую тактику."
         elif key in ("rename_clan", "rename_group"):
             effect_text = "Напишите новое название следующим сообщением."
 
@@ -163,6 +178,8 @@ async def cb_shop_buy(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(StateFilter(ShopRename.waiting_clan_name))
 async def process_rename_clan(message: Message, state: FSMContext) -> None:
+    if await check_command_escape(message, state):
+        return
     new_name = (message.text or "").strip()
     if not new_name or len(new_name) > 40:
         await message.reply("Название должно быть от 1 до 40 символов. Попробуйте ещё раз:")
@@ -181,6 +198,8 @@ async def process_rename_clan(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(ShopRename.waiting_group_name))
 async def process_rename_group(message: Message, state: FSMContext, bot: Bot) -> None:
+    if await check_command_escape(message, state):
+        return
     new_name = (message.text or "").strip()
     if not new_name or len(new_name) > 128:
         await message.reply("Название должно быть от 1 до 128 символов. Попробуйте ещё раз:")

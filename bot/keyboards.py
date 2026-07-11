@@ -54,9 +54,9 @@ def board_revealed_kb(opened_cells: list, mine_positions: list, portal_positions
         if i == exploded_cell:
             text = "💥"
         elif i in mine_positions:
-            text = "🔴"
+            text = "💣"
         elif i in portal_positions:
-            text = "🌀"
+            text = "🔝"
         elif i in opened_cells:
             text = "✅"
         else:

@@ -197,17 +197,7 @@ async def cb_help_page(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.message(Command("clan"))
-async def cmd_clan(message: Message) -> None:
-    async with Storage() as db:
-        clan = _find_user_clan(db, message.from_user.id)
-        if clan:
-            ensure_clan_fields(clan)
-
-    if not clan:
-        await message.reply("Вы не состоите ни в одном клане. Используйте /join или /createclan.")
-        return
-
+def build_clan_text(clan: dict) -> str:
     members = list(clan.get("members", {}).values())
     members_lines = []
     for m in members:
@@ -222,9 +212,16 @@ async def cmd_clan(message: Message) -> None:
         best_line = f'x{best["value"]:.2f}'.replace(".", ",") + f" ({best_name})"
 
     medals = clan.get("medals", {"gold": 0, "silver": 0, "bronze": 0})
-    tactic_name = config.SEASON_TACTICS.get(clan.get("tactic")) if clan.get("tactic") else "не выбрана (см. /tactic)"
+    tactic_key = clan.get("tactic")
+    if tactic_key:
+        tactic_name = config.SEASON_TACTICS.get(tactic_key, tactic_key)
+        from bot.handlers.tactics import TACTIC_DESCRIPTIONS
+        tactic_desc = TACTIC_DESCRIPTIONS.get(tactic_key, "")
+        tactic_block = f"🎯 <b>Тактика сезона: {tactic_name}</b>\n{tactic_desc}"
+    else:
+        tactic_block = "🎯 Тактика сезона: не выбрана (см. /tactic)"
 
-    text = (
+    return (
         f"{clan_prefix(clan)}\n"
         f"🏰 <b>{clan['name']}</b>\n"
         f"📝 Девиз: {clan['motto']}\n\n"
@@ -235,13 +232,16 @@ async def cmd_clan(message: Message) -> None:
         f"⭐ Максимальная серия побед: {clan.get('max_win_streak', 0)}\n"
         f"🏅 Побед в войне кланов: {clan.get('wars_won', 0)}\n"
         f"💎 Лучший выигрышный множитель за бой: {best_line}\n"
-        f"🎯 Тактика сезона: {tactic_name}\n\n"
+        f"{tactic_block}\n\n"
         f"📜 <b>История:</b>\n"
         f"Сезонов сыграно: {clan.get('seasons_played', 0)}\n"
         f"🥇 x{medals.get('gold', 0)}  🥈 x{medals.get('silver', 0)}  🥉 x{medals.get('bronze', 0)}\n\n"
         f"👥 <b>Участники ({len(members)}):</b>\n" + "\n".join(members_lines)
     )
 
+
+async def send_clan_card(message: Message, clan: dict) -> None:
+    text = build_clan_text(clan)
     avatar = clan.get("avatar_file_id")
     if avatar:
         try:
@@ -255,7 +255,21 @@ async def cmd_clan(message: Message) -> None:
             return
         except Exception:
             pass  # если фото вдруг недоступно — отправим просто текстом ниже
-    await message.reply(text, parse_mode="HTML")
+    await message.answer(text, parse_mode="HTML")
+
+
+@router.message(Command("clan"))
+async def cmd_clan(message: Message) -> None:
+    async with Storage() as db:
+        clan = _find_user_clan(db, message.from_user.id)
+        if clan:
+            ensure_clan_fields(clan)
+
+    if not clan:
+        await message.reply("Вы не состоите ни в одном клане. Используйте /join или /createclan.")
+        return
+
+    await send_clan_card(message, clan)
 
 
 @router.message(Command("setgroup"))

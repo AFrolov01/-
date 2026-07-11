@@ -7,6 +7,7 @@ from aiogram.types import Message, CallbackQuery
 
 from bot.storage import Storage, now
 from bot.keyboards import skip_avatar_kb
+from bot.fsm_utils import check_command_escape
 
 router = Router(name="clan_create")
 
@@ -38,6 +39,8 @@ async def cmd_create_clan(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(CreateClan.waiting_name))
 async def process_name(message: Message, state: FSMContext) -> None:
+    if await check_command_escape(message, state):
+        return
     name = (message.text or "").strip()
     if not name or len(name) > 40:
         await message.reply("Название должно быть от 1 до 40 символов. Попробуйте ещё раз:")
@@ -68,6 +71,8 @@ async def process_avatar_skip(callback: CallbackQuery, state: FSMContext) -> Non
 
 @router.message(StateFilter(CreateClan.waiting_motto))
 async def process_motto(message: Message, state: FSMContext) -> None:
+    if await check_command_escape(message, state):
+        return
     motto = (message.text or "").strip()
     if not motto or len(motto) > 120:
         await message.reply("Девиз должен быть от 1 до 120 символов. Попробуйте ещё раз:")

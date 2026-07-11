@@ -173,6 +173,9 @@ def bank_days_left_to_withdraw(player: dict) -> float:
         return 0.0
     elapsed_days = (time.time() - deposited_at) / 86400
     return max(0.0, config.BANK_MIN_HOLD_DAYS - elapsed_days)
+
+
+def average_multiplier_all_time(player: dict) -> float:
     count = player.get("all_time_mult_count", 0)
     if not count:
         return 0.0

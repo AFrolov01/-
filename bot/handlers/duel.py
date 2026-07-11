@@ -478,6 +478,7 @@ async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
     pinned_to_unpin = None
     reveal_kb = None
     item_notes = []
+    next_attempt_note = None
     async with Storage() as db:
         duel = db["active_duels"].get(str(duel_id))
         if not duel:
@@ -502,7 +503,6 @@ async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
         player = players.get_or_create_player(db, user.id, user.username or "", user.first_name or "Игрок")
 
         new_achievements = []
-        more_attempts_note = ""
 
         if idx in side.get("portal_positions", []):
             # --- ПОРТАЛ: сброс поля, множитель сгорает, усиление растёт ---
@@ -538,21 +538,19 @@ async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
                 side["result"] = "win"
                 side["multiplier"] = 1.0
                 text = effect_note + "\n\n" + _cashout_text_for(clan, 1.0, round(side["stake"]), round(side["stake"]), new_points)
-                kb = None
             else:
                 side["result"] = "loss"
                 text = texts.lose_text(clan["name"], old_points, new_points, possible_multiplier, possible_al, applied_mult)
                 if effect_note:
                     text = effect_note + "\n\n" + text
-                kb = board_kb(duel_id, side["opened_cells"], exploded=True)
 
             reveal_kb = _revealed_kb_for(side, exploded_cell=idx)
+            kb = reveal_kb
             item_notes = players.tick_temporary_items(player, side.get("portal_triggered_this_round", False))
 
             has_more, extra = _finish_attempt(duel, side, side_key, db)
             if has_more:
-                more_attempts_note = "\n\n" + extra
-                kb = mine_count_kb(duel_id)
+                next_attempt_note = extra
             else:
                 finalize_text, pinned_to_unpin = extra
         else:
@@ -572,15 +570,14 @@ async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
                     "🌟 Все безопасные клетки открыты! Автоматически забираем выигрыш.\n\n"
                     + _cashout_text_for(clan, side["current_multiplier"], won_al, base_al, new_points, grapes_note)
                 )
-                kb = None
 
                 reveal_kb = _revealed_kb_for(side)
+                kb = reveal_kb
                 item_notes = players.tick_temporary_items(player, side.get("portal_triggered_this_round", False))
 
                 has_more, extra = _finish_attempt(duel, side, side_key, db)
                 if has_more:
-                    more_attempts_note = "\n\n" + extra
-                    kb = mine_count_kb(duel_id)
+                    next_attempt_note = extra
                 else:
                     finalize_text, pinned_to_unpin = extra
             else:
@@ -593,16 +590,11 @@ async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
                 kb = board_kb(duel_id, side["opened_cells"])
 
     try:
-        await callback.message.edit_text(text + more_attempts_note, parse_mode="HTML", reply_markup=kb)
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception:
         pass
     await callback.answer()
 
-    if reveal_kb:
-        try:
-            await callback.message.answer("🔍 <b>Вот как было устроено поле:</b>", parse_mode="HTML", reply_markup=reveal_kb)
-        except Exception:
-            pass
     if item_notes:
         try:
             await callback.message.answer("\n".join(item_notes))
@@ -611,6 +603,11 @@ async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
     if new_achievements:
         try:
             await callback.message.answer(texts.new_achievements_text(new_achievements), parse_mode="HTML")
+        except Exception:
+            pass
+    if next_attempt_note:
+        try:
+            await callback.message.answer(next_attempt_note, reply_markup=mine_count_kb(duel_id))
         except Exception:
             pass
     if finalize_text:
@@ -630,7 +627,7 @@ async def cb_cashout(callback: CallbackQuery, bot: Bot) -> None:
 
     finalize_text = None
     pinned_to_unpin = None
-    more_attempts_note = ""
+    next_attempt_note = None
     async with Storage() as db:
         duel = db["active_duels"].get(str(duel_id))
         if not duel:
@@ -656,28 +653,21 @@ async def cb_cashout(callback: CallbackQuery, bot: Bot) -> None:
         side["multiplier"] = multiplier
 
         text = _cashout_text_for(clan, multiplier, won_al, base_al, new_points, grapes_note)
-        reveal_kb = _revealed_kb_for(side)
+        kb = _revealed_kb_for(side)
         item_notes = players.tick_temporary_items(player, side.get("portal_triggered_this_round", False))
 
         has_more, extra = _finish_attempt(duel, side, side_key, db)
-        kb = None
         if has_more:
-            more_attempts_note = "\n\n" + extra
-            kb = mine_count_kb(duel_id)
+            next_attempt_note = extra
         else:
             finalize_text, pinned_to_unpin = extra
 
     try:
-        await callback.message.edit_text(text + more_attempts_note, parse_mode="HTML", reply_markup=kb)
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception:
         pass
     await callback.answer("Очки зафиксированы!")
 
-    if reveal_kb:
-        try:
-            await callback.message.answer("🔍 <b>Вот как было устроено поле:</b>", parse_mode="HTML", reply_markup=reveal_kb)
-        except Exception:
-            pass
     if item_notes:
         try:
             await callback.message.answer("\n".join(item_notes))
@@ -686,6 +676,11 @@ async def cb_cashout(callback: CallbackQuery, bot: Bot) -> None:
     if new_achievements:
         try:
             await callback.message.answer(texts.new_achievements_text(new_achievements), parse_mode="HTML")
+        except Exception:
+            pass
+    if next_attempt_note:
+        try:
+            await callback.message.answer(next_attempt_note, reply_markup=mine_count_kb(duel_id))
         except Exception:
             pass
     if finalize_text:
@@ -712,7 +707,7 @@ async def afk_watcher_loop(bot: Bot) -> None:
 
 
 async def _check_afk_once(bot: Bot) -> None:
-    to_notify = []  # (chat_id, message_id, text, kb, finalize_text, pinned_to_unpin, reveal_kb)
+    to_notify = []  # (chat_id, message_id, text, kb, finalize_text, pinned_to_unpin, next_attempt)
 
     async with Storage() as db:
         for duel_id_s, duel in list(db["active_duels"].items()):
@@ -754,29 +749,27 @@ async def _check_afk_once(bot: Bot) -> None:
                 if item_notes:
                     text += "\n\n" + "\n".join(item_notes)
 
+                kb = _revealed_kb_for(side)
+
                 has_more, extra = _finish_attempt(duel, side, side_key, db)
                 finalize_text = None
                 pinned_to_unpin = None
-                kb = None
-                if has_more:
-                    text += "\n\n" + extra
-                    kb = mine_count_kb(int(duel_id_s))
-                else:
+                next_attempt = extra if has_more else None
+                if not has_more:
                     finalize_text, pinned_to_unpin = extra
 
-                reveal_kb = _revealed_kb_for(side)
-                to_notify.append((side["chat_id"], side["message_id"], text, kb, finalize_text, pinned_to_unpin, reveal_kb))
+                to_notify.append((side["chat_id"], side["message_id"], text, kb, finalize_text, pinned_to_unpin, next_attempt, int(duel_id_s)))
 
-    for chat_id, message_id, text, kb, finalize_text, pinned_to_unpin, reveal_kb in to_notify:
+    for chat_id, message_id, text, kb, finalize_text, pinned_to_unpin, next_attempt, duel_id in to_notify:
         try:
             await bot.edit_message_text(
                 chat_id=chat_id, message_id=message_id, text=text, parse_mode="HTML", reply_markup=kb
             )
         except Exception:
             pass
-        if reveal_kb:
+        if next_attempt:
             try:
-                await bot.send_message(chat_id, "🔍 <b>Вот как было устроено поле:</b>", parse_mode="HTML", reply_markup=reveal_kb)
+                await bot.send_message(chat_id, next_attempt, reply_markup=mine_count_kb(duel_id))
             except Exception:
                 pass
         if finalize_text:

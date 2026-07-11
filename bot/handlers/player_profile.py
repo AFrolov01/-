@@ -5,6 +5,8 @@
  - /iam или сообщение "Б" (без слэша) — показывает СОБСТВЕННЫЙ профиль.
  - "твой б" ответом на чьё-то сообщение — показывает профиль ТОГО, кому
    отвечаешь; без ответа бот пишет "сообщение не выбрано".
+ - "К" (без слэша) — показывает СОБСТВЕННЫЙ клан (аналог /clan).
+ - "твой к" ответом на чьё-то сообщение — показывает клан ТОГО, кому отвечаешь.
  - "я помылся" — секретное достижение (без объявления, что это триггер).
 """
 
@@ -91,3 +93,38 @@ async def secret_achievement(message: Message) -> None:
 
     if is_new:
         await message.reply("ору с тебя 🛀")
+
+
+@router.message(F.text.lower() == "к")
+async def trigger_own_clan(message: Message) -> None:
+    from bot.handlers.clan_info import send_clan_card
+
+    async with Storage() as db:
+        clan = _find_user_clan(db, message.from_user.id)
+        if clan:
+            ensure_clan_fields(clan)
+
+    if not clan:
+        await message.reply("Вы не состоите ни в одном клане.")
+        return
+    await send_clan_card(message, clan)
+
+
+@router.message(F.text.lower() == "твой к")
+async def trigger_other_clan(message: Message) -> None:
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("сообщение не выбрано")
+        return
+
+    from bot.handlers.clan_info import send_clan_card
+
+    target_id = message.reply_to_message.from_user.id
+    async with Storage() as db:
+        clan = _find_user_clan(db, target_id)
+        if clan:
+            ensure_clan_fields(clan)
+
+    if not clan:
+        await message.reply("Этот игрок не состоит ни в одном клане.")
+        return
+    await send_clan_card(message, clan)

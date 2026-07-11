@@ -15,6 +15,13 @@
  - если предыдущий вызов игрока клана остался неотыгранным, его попытка
    переходит следующему в очереди с накоплением (см. bot/turns.py).
 
+ВАЖНО (исправление критичного бага): игрок, который прямо СЕЙЧАС находится в
+незавершённой дуэли (выбирает мины или уже играет), НИКОГДА не выбирается для
+НОВОГО вызова — очередь просто пропускает его и берёт следующего. Раньше здесь
+была принудительная "зачистка" старых дуэлей перед каждым новым вызовом, но
+она по ошибке могла преждевременно завершать ЧУЖУЮ сторону дуэли, пока
+соперник ещё реально играл — это и вызывало "дуэль уже завершена" посреди игры.
+
 Состояние чередования (кого позвать соперником — другого аутсайдера или лидера)
 хранится в самом db как db["matchmaking_alternate_leader"] (bool).
 """
@@ -29,11 +36,25 @@ import config
 from bot.storage import Storage, now
 from bot import texts
 from bot.clan_utils import ensure_clan_fields
-from bot.turns import force_expire_before_new_duel
 
 
-def _pick_member(clan: dict) -> Optional[dict]:
-    """Выбирает следующего игрока клана строго по скрытой очереди (round-robin)."""
+def _is_member_busy(db: dict, user_id: int) -> bool:
+    """True, если игрок сейчас участвует в невыгранной дуэли (приглашён, но ещё
+    не сыграл, либо уже играет) — таких нельзя вызывать на новую дуэль."""
+    invite = db.get("pending_invite")
+    if invite and user_id in (invite.get("player_a_id"), invite.get("player_b_id")):
+        return True
+    for duel in db.get("active_duels", {}).values():
+        for side_key in ("a", "b"):
+            side = duel["sides"][side_key]
+            if side["player_id"] == user_id and side["stage"] in ("choose_mines", "playing"):
+                return True
+    return False
+
+
+def _pick_member(clan: dict, db: dict) -> Optional[dict]:
+    """Выбирает следующего СВОБОДНОГО игрока клана по скрытой очереди (round-robin),
+    пропуская тех, кто прямо сейчас занят в другой незавершённой дуэли."""
     members = clan.get("members", {})
     if not members:
         return None
@@ -44,10 +65,17 @@ def _pick_member(clan: dict) -> Optional[dict]:
             queue.append(uid)
     if not queue:
         return None
-    next_uid = queue.pop(0)
-    queue.append(next_uid)
-    clan["queue"] = queue
-    return members[next_uid]
+
+    for i, uid in enumerate(queue):
+        if _is_member_busy(db, int(uid)):
+            continue
+        # переносим выбранного в конец очереди (обычная ротация), остальных не трогаем
+        queue.pop(i)
+        queue.append(uid)
+        clan["queue"] = queue
+        return members[uid]
+
+    return None  # все участники клана сейчас заняты в других дуэлях
 
 
 def pick_duel_pair(db: dict) -> Optional[Tuple[dict, dict, dict, dict]]:
@@ -78,8 +106,8 @@ def pick_duel_pair(db: dict) -> Optional[Tuple[dict, dict, dict, dict]]:
         clan_b = rest_sorted[0]
         db["matchmaking_alternate_leader"] = not alternate_leader
 
-    member_a = _pick_member(clan_a)
-    member_b = _pick_member(clan_b)
+    member_a = _pick_member(clan_a, db)
+    member_b = _pick_member(clan_b, db)
     if not member_a or not member_b:
         return None
     return clan_a, member_a, clan_b, member_b
@@ -88,11 +116,6 @@ def pick_duel_pair(db: dict) -> Optional[Tuple[dict, dict, dict, dict]]:
 async def announce_duel(bot: Bot) -> Tuple[bool, str]:
     """Возвращает (успех, причина/описание) — удобно и для планировщика, и для
     ручного вызова админом командой /forceduel из ЛС бота."""
-    # сначала принудительно закрываем любые старые незавершённые вызовы/дуэли —
-    # переносим их попытки следующим в очереди и открепляем старые сообщения,
-    # чтобы не путать "чьи это накопленные попытки" и не плодить закреплённые дубли
-    await force_expire_before_new_duel(bot)
-
     async with Storage() as db:
         group_id = db.get("group_chat_id")
         if not group_id:
@@ -101,7 +124,10 @@ async def announce_duel(bot: Bot) -> Tuple[bool, str]:
             return False, "Предыдущий вызов на дуэль ещё не сыгран (ждём /minduel от вызванных игроков)."
         pair = pick_duel_pair(db)
         if not pair:
-            return False, "Недостаточно кланов с участниками для дуэли (нужно минимум 2 клана с игроками)."
+            return False, (
+                "Недостаточно кланов со свободными участниками для дуэли прямо сейчас "
+                "(нужно минимум 2 клана, у которых есть игрок, не занятый в другой дуэли)."
+            )
         clan_a, member_a, clan_b, member_b = pair
 
         attempts_a = clan_a.get("carried_attempts", 1)
