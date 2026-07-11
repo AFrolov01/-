@@ -217,7 +217,7 @@ def build_clan_text(clan: dict) -> str:
         tactic_name = config.SEASON_TACTICS.get(tactic_key, tactic_key)
         from bot.handlers.tactics import TACTIC_DESCRIPTIONS
         tactic_desc = TACTIC_DESCRIPTIONS.get(tactic_key, "")
-        tactic_block = f"🎯 <b>Тактика сезона: {tactic_name}</b>\n{tactic_desc}"
+        tactic_block = f"🎯 Тактика сезона:\n{tactic_desc}" if tactic_desc else f"🎯 Тактика сезона: {tactic_name}"
     else:
         tactic_block = "🎯 Тактика сезона: не выбрана (см. /tactic)"
 

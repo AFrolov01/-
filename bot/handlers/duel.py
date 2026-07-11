@@ -109,7 +109,7 @@ def _apply_loss(clan: dict, side: dict, player: dict) -> Tuple[float, str, bool,
 
     if shop.get("next_loss_forgiven"):
         shop["next_loss_forgiven"] = False
-        new_points, won_al, base_al, new_ach, _grapes_note = _apply_cashout(
+        new_points, won_al, base_al, new_ach, _grapes_note, _tactic_note = _apply_cashout(
             clan, side, player, 1.0, side["stake"], player["user_id"],
             player.get("username") or player.get("first_name")
         )
@@ -127,13 +127,15 @@ def _apply_loss(clan: dict, side: dict, player: dict) -> Tuple[float, str, bool,
 
 def _apply_cashout(
     clan: dict, side: dict, player: dict, multiplier: float, stake: int, user_id: int, username: str
-) -> Tuple[float, int, int, list, str]:
-    """Возвращает (новые_очки, выигрыш_с_модификаторами, выигрыш_до_недельного_модификатора, новые_ачивки, заметка_о_личном_предмете).
+) -> Tuple[float, int, int, list, str, str]:
+    """Возвращает (новые_очки, выигрыш_с_модификаторами, выигрыш_до_недельного_модификатора,
+    новые_ачивки, заметка_о_личном_предмете, заметка_о_бонусе_тактики).
     `multiplier` уже включает шаги 1+2 (поле + усиление портала)."""
     shop = player.setdefault("shop", _default_shop())
 
     # шаг 3: % тактики клана (+ next_win_boost как временный аналогичный бонус)
-    tactic_mult = tactics.win_points_multiplier(clan, side, player)
+    pure_tactic_mult = tactics.win_points_multiplier(clan, side, player)
+    tactic_mult = pure_tactic_mult
     if shop.get("next_win_boost"):
         shop["next_win_boost"] = False
         tactic_mult *= 1.5
@@ -175,15 +177,16 @@ def _apply_cashout(
         }
 
     tactics.register_round_result(clan, won=True)
+    tactic_note = tactics.describe_tactic_bonus(clan, side, player, pure_tactic_mult)
     te_gain = round(multiplier * tactics.currency_multiplier(clan, side), 2)
     new_ach = players.record_round_result(player, won=True, multiplier=multiplier, currency_gain=te_gain)
 
-    return new_points, won_al, base_al, new_ach, grapes_note
+    return new_points, won_al, base_al, new_ach, grapes_note, tactic_note
 
 
-def _cashout_text_for(clan: dict, multiplier: float, won_al: int, base_al: int, new_points: float, grapes_note: str = "") -> str:
+def _cashout_text_for(clan: dict, multiplier: float, won_al: int, base_al: int, new_points: float, grapes_note: str = "", tactic_note: str = "") -> str:
     weekly_pct = clan.get("weekly_percent_modifier", 0)
-    return texts.cashout_text(clan["name"], multiplier, won_al, new_points, weekly_pct, base_al, grapes_note)
+    return texts.cashout_text(clan["name"], multiplier, won_al, new_points, weekly_pct, base_al, grapes_note, tactic_note)
 
 
 def _finalize_duel_result(db: dict, duel: dict) -> str:
@@ -561,14 +564,14 @@ async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
 
             max_possible = config.TOTAL_CELLS - mines - len(side.get("portal_positions", []))
             if opened_count >= max_possible:
-                new_points, won_al, base_al, new_achievements, grapes_note = _apply_cashout(
+                new_points, won_al, base_al, new_achievements, grapes_note, tactic_note = _apply_cashout(
                     clan, side, player, side["current_multiplier"], side["stake"],
                     user.id, user.username or user.first_name
                 )
                 side["result"] = "win"
                 text = (
                     "🌟 Все безопасные клетки открыты! Автоматически забираем выигрыш.\n\n"
-                    + _cashout_text_for(clan, side["current_multiplier"], won_al, base_al, new_points, grapes_note)
+                    + _cashout_text_for(clan, side["current_multiplier"], won_al, base_al, new_points, grapes_note, tactic_note)
                 )
 
                 reveal_kb = _revealed_kb_for(side)
@@ -646,13 +649,13 @@ async def cb_cashout(callback: CallbackQuery, bot: Bot) -> None:
         user = callback.from_user
         player = players.get_or_create_player(db, user.id, user.username or "", user.first_name or "Игрок")
         multiplier = side["current_multiplier"] if side["opened_cells"] else 1.0
-        new_points, won_al, base_al, new_achievements, grapes_note = _apply_cashout(
+        new_points, won_al, base_al, new_achievements, grapes_note, tactic_note = _apply_cashout(
             clan, side, player, multiplier, side["stake"], user.id, user.username or user.first_name
         )
         side["result"] = "win"
         side["multiplier"] = multiplier
 
-        text = _cashout_text_for(clan, multiplier, won_al, base_al, new_points, grapes_note)
+        text = _cashout_text_for(clan, multiplier, won_al, base_al, new_points, grapes_note, tactic_note)
         kb = _revealed_kb_for(side)
         item_notes = players.tick_temporary_items(player, side.get("portal_triggered_this_round", False))
 
@@ -731,7 +734,7 @@ async def _check_afk_once(bot: Bot) -> None:
                     db, side["player_id"], member.get("username", ""), member.get("first_name", "Игрок")
                 )
 
-                new_points, won_al, base_al, new_achievements, grapes_note = _apply_cashout(
+                new_points, won_al, base_al, new_achievements, grapes_note, tactic_note = _apply_cashout(
                     clan, side, player, multiplier, side["stake"], side["player_id"], username
                 )
                 side["result"] = "win"
@@ -740,7 +743,7 @@ async def _check_afk_once(bot: Bot) -> None:
                 text = (
                     texts.afk_autocashout_text(f"@{username}" if member.get("username") else username)
                     + "\n\n"
-                    + _cashout_text_for(clan, multiplier, won_al, base_al, new_points, grapes_note)
+                    + _cashout_text_for(clan, multiplier, won_al, base_al, new_points, grapes_note, tactic_note)
                 )
                 if new_achievements:
                     text += "\n\n" + texts.new_achievements_text(new_achievements)

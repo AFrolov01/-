@@ -87,11 +87,13 @@ def lose_text(clan_name: str, old_points: float, new_points: float, possible_mul
     )
 
 
-def cashout_text(clan_name: str, multiplier: float, won_al: int, new_points: float, weekly_pct: int = 0, base_al: int = None, grapes_note: str = "") -> str:
+def cashout_text(clan_name: str, multiplier: float, won_al: int, new_points: float, weekly_pct: int = 0, base_al: int = None, grapes_note: str = "", tactic_note: str = "") -> str:
     text = (
         "✅ <b>Вы забрали выигрыш!</b>\n"
         f"Множитель: x{multiplier:.2f}".replace(".", ",") + f" ({won_al} Al)\n"
     )
+    if tactic_note:
+        text += tactic_note + "\n"
     if weekly_pct and base_al is not None and base_al != won_al:
         sign = "+" if weekly_pct > 0 else ""
         diff = won_al - base_al

@@ -102,6 +102,32 @@ def weekly_modifier_multiplier(clan: dict) -> float:
     return max(0.0, 1 + weekly_modifier_fraction(clan))
 
 
+def describe_tactic_bonus(clan: dict, side: dict, player: dict, applied_mult: float) -> str:
+    """Текст про то, какой бонус дала тактика В ЭТОМ раунде и какой даст в
+    СЛЕДУЮЩИЙ раз (только для тактик, где это предсказуемо: серия побед и
+    хомяк — для "азарта" бонус каждый раз случайный, для остальных тактик
+    win_points_multiplier не меняется от победы, показывать нечего)."""
+    tactic = clan.get("tactic")
+    if tactic not in ("streak", "hamster"):
+        return ""
+
+    import config
+    tactic_name = config.SEASON_TACTICS.get(tactic, tactic)
+    this_pct = round((applied_mult - 1) * 100)
+
+    # предсказываем бонус следующей победы — состояние клана/игрока уже
+    # обновлено этим раундом (register_round_result уже вызван к этому моменту)
+    next_mult = win_points_multiplier(clan, side, player)
+    next_pct = round((next_mult - 1) * 100)
+
+    this_sign = "+" if this_pct >= 0 else ""
+    next_sign = "+" if next_pct >= 0 else ""
+    return (
+        f"🎯 Тактика «{tactic_name}»: бонус в этом раунде {this_sign}{this_pct}%, "
+        f"при следующей победе будет {next_sign}{next_pct}%"
+    )
+
+
 def register_round_result(clan: dict, won: bool) -> None:
     """Обновляет серии побед/поражений НА УРОВНЕ ОТДЕЛЬНОГО РАУНДА (для тактик
     "мы уже красные" / "да да нет нет" — не путать с серией побед в дуэли)."""
