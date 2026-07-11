@@ -59,7 +59,7 @@ async def cmd_shop(message: Message) -> None:
         builder.button(text=f"{price} Те: {desc[:28]}...", callback_data=f"shop:buy:{key}")
     builder.adjust(1)
 
-    await message.reply("\n".join(lines), reply_markup=builder.as_markup())
+    await message.reply("\n".join(lines), parse_mode="HTML", reply_markup=builder.as_markup())
 
 
 @router.callback_query(F.data.startswith("shop:buy:"))
