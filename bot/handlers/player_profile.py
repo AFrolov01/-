@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Профиль игрока.
+Профиль игрока (своя экономика/статистика в каждой группе).
 
  - /iam или сообщение "Б" (без слэша) — показывает СОБСТВЕННЫЙ профиль.
  - "твой б" ответом на чьё-то сообщение — показывает профиль ТОГО, кому
@@ -16,6 +16,7 @@ from aiogram.types import Message
 
 import config
 from bot.storage import Storage
+from bot.chat_state import get_chat, resolve_chat_for_message
 from bot import players
 from bot.clan_utils import ensure_clan_fields
 from bot.leveling import clan_prefix
@@ -23,19 +24,19 @@ from bot.leveling import clan_prefix
 router = Router(name="player_profile")
 
 
-def _find_user_clan(db: dict, user_id: int):
-    for clan in db["clans"].values():
+def _find_user_clan(chat: dict, user_id: int):
+    for clan in chat["clans"].values():
         if str(user_id) in clan.get("members", {}):
             return clan
     return None
 
 
-def _build_profile_text(db: dict, user_id: int) -> str:
-    player = players.find_player(db, user_id)
+def _build_profile_text(chat: dict, user_id: int) -> str:
+    player = players.find_player(chat, user_id)
     if not player:
-        return "У этого игрока пока нет ни одного сыгранного раунда."
+        return "У этого игрока пока нет ни одного сыгранного раунда в этой группе."
 
-    clan = _find_user_clan(db, user_id)
+    clan = _find_user_clan(chat, user_id)
     clan_line = "не состоит в клане"
     if clan:
         ensure_clan_fields(clan)
@@ -61,14 +62,24 @@ def _build_profile_text(db: dict, user_id: int) -> str:
 @router.message(Command("iam"))
 async def cmd_iam(message: Message) -> None:
     async with Storage() as db:
-        text = _build_profile_text(db, message.from_user.id)
+        chat_id, error = await resolve_chat_for_message(message, db)
+        if error:
+            await message.reply(error)
+            return
+        chat = get_chat(db, chat_id)
+        text = _build_profile_text(chat, message.from_user.id)
     await message.reply(text, parse_mode="HTML")
 
 
 @router.message(F.text.lower() == "б")
 async def trigger_own_profile(message: Message) -> None:
     async with Storage() as db:
-        text = _build_profile_text(db, message.from_user.id)
+        chat_id, error = await resolve_chat_for_message(message, db)
+        if error:
+            await message.reply(error)
+            return
+        chat = get_chat(db, chat_id)
+        text = _build_profile_text(chat, message.from_user.id)
     await message.reply(text, parse_mode="HTML")
 
 
@@ -79,15 +90,24 @@ async def trigger_other_profile(message: Message) -> None:
         return
     target_id = message.reply_to_message.from_user.id
     async with Storage() as db:
-        text = _build_profile_text(db, target_id)
+        chat_id, error = await resolve_chat_for_message(message, db)
+        if error:
+            await message.reply(error)
+            return
+        chat = get_chat(db, chat_id)
+        text = _build_profile_text(chat, target_id)
     await message.reply(text, parse_mode="HTML")
 
 
 @router.message(F.text.lower() == "я помылся")
 async def secret_achievement(message: Message) -> None:
     async with Storage() as db:
+        chat_id, error = await resolve_chat_for_message(message, db)
+        if error:
+            return  # тихая секретная ачивка — не спамим ошибками про выбор группы
+        chat = get_chat(db, chat_id)
         player = players.get_or_create_player(
-            db, message.from_user.id, message.from_user.username or "", message.from_user.first_name or "Игрок"
+            chat, message.from_user.id, message.from_user.username or "", message.from_user.first_name or "Игрок"
         )
         is_new = players.unlock_achievement(player, "ya_pomylsya")
 
@@ -100,7 +120,12 @@ async def trigger_own_clan(message: Message) -> None:
     from bot.handlers.clan_info import send_clan_card
 
     async with Storage() as db:
-        clan = _find_user_clan(db, message.from_user.id)
+        chat_id, error = await resolve_chat_for_message(message, db)
+        if error:
+            await message.reply(error)
+            return
+        chat = get_chat(db, chat_id)
+        clan = _find_user_clan(chat, message.from_user.id)
         if clan:
             ensure_clan_fields(clan)
 
@@ -120,7 +145,12 @@ async def trigger_other_clan(message: Message) -> None:
 
     target_id = message.reply_to_message.from_user.id
     async with Storage() as db:
-        clan = _find_user_clan(db, target_id)
+        chat_id, error = await resolve_chat_for_message(message, db)
+        if error:
+            await message.reply(error)
+            return
+        chat = get_chat(db, chat_id)
+        clan = _find_user_clan(chat, target_id)
         if clan:
             ensure_clan_fields(clan)
 

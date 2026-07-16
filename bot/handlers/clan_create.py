@@ -5,7 +5,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery
 
-from bot.storage import Storage, now
+from bot.storage import Storage
+from bot.chat_state import get_chat
 from bot.keyboards import skip_avatar_kb
 from bot.fsm_utils import check_command_escape
 
@@ -18,8 +19,8 @@ class CreateClan(StatesGroup):
     waiting_motto = State()
 
 
-def _user_already_in_clan(db: dict, user_id: int) -> bool:
-    for clan in db["clans"].values():
+def _user_already_in_clan(chat: dict, user_id: int) -> bool:
+    for clan in chat["clans"].values():
         if str(user_id) in clan.get("members", {}):
             return True
     return False
@@ -27,8 +28,18 @@ def _user_already_in_clan(db: dict, user_id: int) -> bool:
 
 @router.message(Command("createclan"))
 async def cmd_create_clan(message: Message, state: FSMContext) -> None:
+    if message.chat.type not in ("group", "supergroup"):
+        await message.reply(
+            "Клан можно создать только внутри группы — у каждой группы своя "
+            "независимая война. Вызовите /createclan прямо в нужном чате."
+        )
+        return
+
     async with Storage() as db:
-        if _user_already_in_clan(db, message.from_user.id):
+        chat = get_chat(db, message.chat.id)
+        if message.chat.title:
+            chat["title"] = message.chat.title
+        if _user_already_in_clan(chat, message.from_user.id):
             await message.reply(
                 "Вы уже состоите в клане. Сначала покиньте текущий клан, чтобы создать новый."
             )
@@ -83,13 +94,14 @@ async def process_motto(message: Message, state: FSMContext) -> None:
     avatar_file_id = data.get("avatar_file_id")
 
     async with Storage() as db:
-        if _user_already_in_clan(db, message.from_user.id):
+        chat = get_chat(db, message.chat.id)
+        if _user_already_in_clan(chat, message.from_user.id):
             await state.clear()
             await message.reply("Вы уже успели вступить в клан, создание отменено.")
             return
 
-        clan_id = db["next_clan_id"]
-        db["next_clan_id"] += 1
+        clan_id = chat["next_clan_id"]
+        chat["next_clan_id"] += 1
 
         user = message.from_user
         member = {
@@ -99,7 +111,7 @@ async def process_motto(message: Message, state: FSMContext) -> None:
             "matches_played": 0,
             "last_played_at": 0,
         }
-        db["clans"][str(clan_id)] = {
+        chat["clans"][str(clan_id)] = {
             "id": clan_id,
             "name": name,
             "motto": motto,
@@ -131,7 +143,7 @@ async def process_motto(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     await message.reply(
-        f"🎉 Клан «{name}» создан и уже участвует в войне кланов!\n"
+        f"🎉 Клан «{name}» создан и уже участвует в войне кланов этой группы!\n"
         f"Девиз: {motto}\n\n"
         "Приглашайте друзей в чат — вступить можно командой /join."
     )

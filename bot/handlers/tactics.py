@@ -6,6 +6,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import config
 from bot.storage import Storage
+from bot.chat_state import get_chat, resolve_chat_for_message
 from bot.clan_utils import ensure_clan_fields
 
 router = Router(name="tactics")
@@ -53,8 +54,8 @@ TACTIC_DESCRIPTIONS = {
 }
 
 
-def _find_user_clan(db: dict, user_id: int):
-    for clan in db["clans"].values():
+def _find_user_clan(chat: dict, user_id: int):
+    for clan in chat["clans"].values():
         if str(user_id) in clan.get("members", {}):
             return clan
     return None
@@ -63,7 +64,12 @@ def _find_user_clan(db: dict, user_id: int):
 @router.message(Command("tactic"))
 async def cmd_tactic(message: Message) -> None:
     async with Storage() as db:
-        clan = _find_user_clan(db, message.from_user.id)
+        chat_id, error = await resolve_chat_for_message(message, db)
+        if error:
+            await message.reply(error)
+            return
+        chat = get_chat(db, chat_id)
+        clan = _find_user_clan(chat, message.from_user.id)
         if not clan:
             await message.reply("Вы не состоите ни в одном клане.")
             return
@@ -72,6 +78,7 @@ async def cmd_tactic(message: Message) -> None:
             return
         ensure_clan_fields(clan)
         current = clan.get("tactic")
+        clan_id = clan["id"]
 
         if clan.get("tactic_locked"):
             name = config.SEASON_TACTICS.get(current, current)
@@ -86,7 +93,7 @@ async def cmd_tactic(message: Message) -> None:
 
     builder = InlineKeyboardBuilder()
     for key, name in config.SEASON_TACTICS.items():
-        builder.button(text=name, callback_data=f"tactic:set:{clan['id']}:{key}")
+        builder.button(text=name, callback_data=f"tactic:set:{chat_id}:{clan_id}:{key}")
     builder.adjust(1)
 
     descriptions = "\n\n".join(TACTIC_DESCRIPTIONS.values())
@@ -99,11 +106,12 @@ async def cmd_tactic(message: Message) -> None:
 
 @router.callback_query(F.data.startswith("tactic:set:"))
 async def cb_tactic_set(callback: CallbackQuery) -> None:
-    _, _, clan_id_s, key = callback.data.split(":")
-    clan_id = int(clan_id_s)
+    _, _, chat_id_s, clan_id_s, key = callback.data.split(":")
+    chat_id, clan_id = int(chat_id_s), int(clan_id_s)
 
     async with Storage() as db:
-        clan = db["clans"].get(str(clan_id))
+        chat = get_chat(db, chat_id)
+        clan = chat["clans"].get(str(clan_id))
         if not clan:
             await callback.answer("Клан не найден.", show_alert=True)
             return

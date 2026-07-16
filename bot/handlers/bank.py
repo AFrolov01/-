@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Банк для валюты Те.
+Банк для валюты Те (своя экономика в каждой группе).
 
  - /bank (без аргументов) — правила + текущий баланс, и сразу спрашивает,
    сколько внести (следующим сообщением). Если в ответ пришло не число —
@@ -24,6 +24,7 @@ from aiogram.types import Message
 
 import config
 from bot.storage import Storage, now
+from bot.chat_state import get_chat, resolve_chat_for_message
 from bot import players
 from bot.fsm_utils import check_command_escape
 
@@ -51,16 +52,15 @@ class BankStates(StatesGroup):
 
 def _info_text(player: dict) -> str:
     balance = players.bank_current_balance(player)
-    principal = player.get("bank", {}).get("balance", 0.0)
-    interest_earned = round(balance - principal, 2)
+    total_interest = players.bank_total_interest_earned(player)
     days_left = players.bank_days_left_to_withdraw(player)
     text = (
         RULES_TEXT
         + f"\n\n💰 На руках: {player.get('currency', 0):.2f} Те\n"
         + f"🏦 На вкладе (с процентами): {balance:.2f} Те"
     )
-    if principal > 0:
-        text += f"\n💹 Начислено процентами с начала вклада: {interest_earned:.2f} Те"
+    if total_interest > 0:
+        text += f"\n💹 Всего начислено процентами за всё время: {total_interest:.2f} Те"
     if balance > 0:
         text += f"\n⏳ До снятия: {days_left:.1f} дн." if days_left > 0 else "\n✅ Снять можно прямо сейчас."
     return text
@@ -87,10 +87,10 @@ async def _do_deposit(message: Message, player: dict, amount: float) -> None:
     if player.get("currency", 0.0) < amount:
         await message.reply(f"Недостаточно Те на руках (есть {player.get('currency', 0):.2f}).")
         return
-    bank = player.setdefault("bank", {"balance": 0.0, "deposited_at": None})
-    current_balance = players.bank_current_balance(player)
+    players.bank_settle(player)  # фиксируем накопленные проценты в общий счётчик, не теряем их
+    bank = player["bank"]
     player["currency"] = round(player["currency"] - amount, 2)
-    bank["balance"] = round(current_balance + amount, 2)
+    bank["balance"] = round(bank["balance"] + amount, 2)
     bank["deposited_at"] = now()
     await message.reply(
         f"✅ Внесено {amount:.2f} Те. Остаток на вкладе: {bank['balance']:.2f} Те.\n"
@@ -103,12 +103,12 @@ async def _do_withdraw(message: Message, player: dict, amount: float) -> None:
     if days_left > 0:
         await message.reply(f"⏳ Ещё рано снимать — подождите {days_left:.1f} дн.")
         return
-    current_balance = players.bank_current_balance(player)
-    if amount > current_balance:
-        await message.reply(f"На вкладе только {current_balance:.2f} Те.")
+    players.bank_settle(player)  # фиксируем накопленные проценты в общий счётчик, не теряем их
+    bank = player["bank"]
+    if amount > bank["balance"]:
+        await message.reply(f"На вкладе только {bank['balance']:.2f} Те.")
         return
-    bank = player.setdefault("bank", {"balance": 0.0, "deposited_at": None})
-    remaining = round(current_balance - amount, 2)
+    remaining = round(bank["balance"] - amount, 2)
     bank["balance"] = remaining
     bank["deposited_at"] = now() if remaining > 0 else None
     player["currency"] = round(player.get("currency", 0.0) + amount, 2)
@@ -125,13 +125,19 @@ async def _handle_bank_request(message: Message, state: FSMContext, action_text:
     amount_raw = parts[1] if len(parts) > 1 else ""
 
     async with Storage() as db:
+        chat_id, error = await resolve_chat_for_message(message, db)
+        if error:
+            await message.reply(error)
+            return
+        chat = get_chat(db, chat_id)
         player = players.get_or_create_player(
-            db, message.from_user.id, message.from_user.username or "", message.from_user.first_name or "Игрок"
+            chat, message.from_user.id, message.from_user.username or "", message.from_user.first_name or "Игрок"
         )
 
         if action in ("положить", "внести"):
             if not amount_raw:
                 await message.reply(_info_text(player) + "\n\n➕ Сколько внести? Напишите число (или «всё»).")
+                await state.update_data(chat_id=chat_id)
                 await state.set_state(BankStates.waiting_deposit_amount)
                 return
             amount, error = _parse_amount(amount_raw, player, for_withdraw=False)
@@ -147,6 +153,7 @@ async def _handle_bank_request(message: Message, state: FSMContext, action_text:
         if action in ("снять", "вывести"):
             if not amount_raw:
                 await message.reply(_info_text(player) + "\n\n➖ Сколько снять? Напишите число (или «всё»).")
+                await state.update_data(chat_id=chat_id)
                 await state.set_state(BankStates.waiting_withdraw_amount)
                 return
             amount, error = _parse_amount(amount_raw, player, for_withdraw=True)
@@ -162,6 +169,7 @@ async def _handle_bank_request(message: Message, state: FSMContext, action_text:
         # без аргументов (или нераспознанное слово) — просто показать информацию
         # и сразу спросить, сколько внести, чтобы не нужно было звать команду снова
         await message.reply(_info_text(player) + "\n\n➕ Сколько внести? Напишите число (или «всё»).")
+        await state.update_data(chat_id=chat_id)
         await state.set_state(BankStates.waiting_deposit_amount)
 
 
@@ -191,9 +199,12 @@ async def text_bank_trigger(message: Message, state: FSMContext) -> None:
 async def process_deposit_amount(message: Message, state: FSMContext) -> None:
     if await check_command_escape(message, state):
         return
+    data = await state.get_data()
+    chat_id = data.get("chat_id")
     async with Storage() as db:
+        chat = get_chat(db, chat_id)
         player = players.get_or_create_player(
-            db, message.from_user.id, message.from_user.username or "", message.from_user.first_name or "Игрок"
+            chat, message.from_user.id, message.from_user.username or "", message.from_user.first_name or "Игрок"
         )
         amount, error = _parse_amount(message.text or "", player, for_withdraw=False)
         if error == "не_число":
@@ -212,9 +223,12 @@ async def process_deposit_amount(message: Message, state: FSMContext) -> None:
 async def process_withdraw_amount(message: Message, state: FSMContext) -> None:
     if await check_command_escape(message, state):
         return
+    data = await state.get_data()
+    chat_id = data.get("chat_id")
     async with Storage() as db:
+        chat = get_chat(db, chat_id)
         player = players.get_or_create_player(
-            db, message.from_user.id, message.from_user.username or "", message.from_user.first_name or "Игрок"
+            chat, message.from_user.id, message.from_user.username or "", message.from_user.first_name or "Игрок"
         )
         amount, error = _parse_amount(message.text or "", player, for_withdraw=True)
         if error == "не_число":

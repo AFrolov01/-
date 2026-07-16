@@ -2,20 +2,25 @@
 """
 Сезон войны кланов.
 
- - Сезон длится config.SEASON_LENGTH_DAYS (30) дней, завершается автоматически:
-   итоги (топ + победитель) публикуются в боевой чат, очки/серии/победы/тактика/
-   недельный модификатор сбрасываются, а УРОВЕНЬ/ОПЫТ/РЕПУТАЦИЯ/ДОСТИЖЕНИЯ/
-   ИСТОРИЯ КЛАНА — НЕТ, они копятся из сезона в сезон. В конце сезона бот
-   также напоминает всем владельцам кланов выбрать тактику на новый сезон.
- - Каждые 7 дней сезона каждый клан получает +-% (по месту в рейтинге) к
-   ОЧКАМ, ПОЛУЧАЕМЫМ В РАУНДАХ МИН (не трогает текущий баланс клана напрямую).
-   Этот %% НАКАПЛИВАЕТСЯ неделя к неделе (складывается, может уйти в 0 или
-   поменять знак, если ранг клана изменился). Топ получает -10%, аутсайдер
-   +10%, промежуточные места — линейно между ними (чем больше кланов, тем
-   мельче шаг). Тактика "Тихо не спеша" заменяет это на фиксированные +-6%
-   для клана, который её выбрал.
- - Репутация клана обнуляется в начале каждого календарного года (сам клан,
-   уровень и достижения — нет, это отдельная система).
+СЕЗОН ОДИН ДЛЯ ВСЕХ ГРУПП (общий таймер: 30 дней, еженедельные события,
+годовой сброс репутации — всё происходит одновременно во всех группах сразу).
+Но КОНКУРЕНЦИЯ (места, топ/аутсайдер, достижения "1 место в сезоне" и т.д.)
+считается ОТДЕЛЬНО внутри каждой группы — группы не соревнуются друг с другом
+напрямую, только между своими кланами.
+
+ - Сезон длится config.SEASON_LENGTH_DAYS (30) дней, завершается автоматически
+   ВЕЗДЕ одновременно: в каждой группе подводятся её собственные итоги (топ +
+   победитель ЭТОЙ группы), очки/серии/победы/тактика/недельный модификатор
+   сбрасываются, а УРОВЕНЬ/ОПЫТ/РЕПУТАЦИЯ/ДОСТИЖЕНИЯ/ИСТОРИЯ КЛАНА — НЕТ, они
+   копятся из сезона в сезон.
+ - Каждые 7 дней (одновременно во всех группах) каждый клан получает +-% (по
+   месту в рейтинге ВНУТРИ СВОЕЙ ГРУППЫ) к очкам, получаемым в раундах мин
+   (не трогает текущий баланс клана напрямую). Этот %% накапливается неделя к
+   неделе. Топ группы получает -10%, аутсайдер +10%, промежуточные места —
+   линейно между ними. Тактика "Тихо не спеша" заменяет это на фиксированные
+   +-6% для клана, который её выбрал.
+ - Репутация клана обнуляется в начале каждого календарного года везде сразу
+   (сам клан, уровень и достижения — нет, это отдельная система).
 """
 
 import asyncio
@@ -25,6 +30,7 @@ from aiogram import Bot
 
 import config
 from bot.storage import Storage, now
+from bot.chat_state import all_chat_ids, get_chat
 from bot.leaderboard import build_top_text
 from bot.clan_utils import ensure_clan_fields
 from bot.leveling import level_from_xp, apply_level_up_reputation
@@ -35,8 +41,8 @@ from bot import players
 # ------------------------------------------------------- завершение сезона -
 
 def _check_clan_achievements(clan: dict, rank: int, total_clans: int) -> list:
-    """Проверяет и разблокирует ачивки клана по итогам сезона. Возвращает
-    список новых ключей (для объявления в чате)."""
+    """Проверяет и разблокирует ачивки клана по итогам сезона (в рамках своей
+    группы). Возвращает список новых ключей (для объявления в чате)."""
     new_keys = []
     points_at_end = clan.get("points", 0)
     achievements = clan.setdefault("achievements", [])
@@ -63,22 +69,28 @@ def _check_clan_achievements(clan: dict, rank: int, total_clans: int) -> list:
     return new_keys
 
 
-def finalize_season_locked(db: dict) -> str:
-    """Подводит итоги сезона: опыт/уровни/репутация/медали/достижения кланов,
-    затем сбрасывает очки/серии/тактики/недельный модификатор сезона.
+def finalize_season_locked(chat: dict) -> str:
+    """Подводит итоги сезона ОДНОЙ группы: опыт/уровни/репутация/медали/
+    достижения её кланов, затем сбрасывает очки/серии/тактики/недельный
+    модификатор. `chat` — состояние конкретной группы (bot/chat_state.py).
     Вызывать ТОЛЬКО внутри `async with Storage() as db:`."""
-    clans = list(db["clans"].values())
+    clans = list(chat["clans"].values())
     for clan in clans:
         ensure_clan_fields(clan)
 
-    final_text = build_top_text(db, "🏁 <b>Сезон войны кланов завершён!</b>", declare_winner=True)
+    if not clans:
+        chat["pending_invite"] = None
+        chat["active_duels"] = {}
+        return ""
+
+    final_text = build_top_text(chat, "🏁 <b>Сезон завершён!</b>", declare_winner=True)
 
     clans_sorted = sorted(clans, key=lambda c: c.get("points", 0), reverse=True)
     total = len(clans_sorted)
     achievement_lines = []
 
     for rank, clan in enumerate(clans_sorted, start=1):
-        # --- репутация за место в сезоне ---
+        # --- репутация за место в сезоне (внутри своей группы) ---
         if total == 1:
             placement_rep = config.REPUTATION_PLACEMENT_1ST
         elif rank == total:
@@ -114,11 +126,11 @@ def finalize_season_locked(db: dict) -> str:
             info = config.CLAN_ACHIEVEMENTS.get(key, {})
             achievement_lines.append(f'«{clan["name"]}» получает {info.get("emoji", "")} {info.get("name", key)}!')
 
-        # --- "победитель" для игроков клана-чемпиона ---
+        # --- "победитель" для игроков клана-чемпиона (своей группы) ---
         if rank == 1:
             for uid_str, member in clan.get("members", {}).items():
                 player = players.get_or_create_player(
-                    db, int(uid_str), member.get("username", ""), member.get("first_name", "Игрок")
+                    chat, int(uid_str), member.get("username", ""), member.get("first_name", "Игрок")
                 )
                 players.unlock_achievement(player, "pobeditel")
 
@@ -142,16 +154,15 @@ def finalize_season_locked(db: dict) -> str:
         "новый сезон командой /tactic — сменить её потом до конца сезона будет нельзя."
     )
 
-    db["pending_invite"] = None
-    db["active_duels"] = {}
-    db["season_started_at"] = now()
-    db["last_weekly_modifier_at"] = now()
+    chat["pending_invite"] = None
+    chat["active_duels"] = {}
     return final_text
 
 
 async def _check_and_finalize(bot: Bot) -> None:
-    final_text = None
-    group_id = None
+    """Сезон общий: проверяем ОДИН глобальный таймер, но при завершении
+    подводим итоги в КАЖДОЙ группе отдельно и рассылаем туда её собственный текст."""
+    to_send = []  # (chat_id, text)
 
     async with Storage() as db:
         started = db.get("season_started_at")
@@ -164,16 +175,20 @@ async def _check_and_finalize(bot: Bot) -> None:
         if elapsed_days < config.SEASON_LENGTH_DAYS:
             return
 
-        if not db["clans"]:
-            db["season_started_at"] = now()
-            return
+        for chat_id in all_chat_ids(db):
+            chat = get_chat(db, chat_id)
+            if not chat["clans"]:
+                continue
+            final_text = finalize_season_locked(chat)
+            if final_text:
+                to_send.append((chat_id, final_text + "\n\n🔄 Начинается новый сезон!"))
 
-        group_id = db.get("group_chat_id")
-        final_text = finalize_season_locked(db)
+        db["season_started_at"] = now()
+        db["last_weekly_modifier_at"] = now()
 
-    if final_text and group_id:
+    for chat_id, text in to_send:
         try:
-            await bot.send_message(group_id, final_text + "\n\n🔄 Начинается новый сезон!", parse_mode="HTML")
+            await bot.send_message(chat_id, text, parse_mode="HTML")
         except Exception:
             pass
 
@@ -188,18 +203,18 @@ def _rank_based_percent(rank_index: int, total: int) -> float:
     return -config.WEEKLY_MODIFIER_MAX_PERCENT + (rank_index / (total - 1)) * span
 
 
-def _apply_weekly_modifier_locked(db: dict) -> str:
-    """Каждые 7 дней происходят ДВА РАЗНЫХ события:
-    1) сжатие текущих очков клана к среднему по всем кланам (10%);
+def _apply_weekly_modifier_for_chat(chat: dict) -> str:
+    """Каждые 7 дней (общий таймер) происходят ДВА РАЗНЫХ события ВНУТРИ
+    каждой группы отдельно:
+    1) сжатие текущих очков клана к среднему ПО СВОЕЙ ГРУППЕ (10%);
     2) отдельно — накопительный %-бонус/штраф к БУДУЩИМ очкам из раундов мин,
-       зависящий от места в рейтинге (или от тактики "Тихо не спеша")."""
-    clans = list(db["clans"].values())
+       зависящий от места в рейтинге СВОЕЙ ГРУППЫ (или от тактики "Тихо не спеша")."""
+    clans = list(chat["clans"].values())
     for clan in clans:
         ensure_clan_fields(clan)
     if len(clans) < 2:
         return ""
 
-    # ранжируем ДО каких-либо изменений — по текущим очкам
     clans_sorted = sorted(clans, key=lambda c: c.get("points", 0), reverse=True)
     total = len(clans_sorted)
     mean_points = sum(c.get("points", 0) for c in clans) / total
@@ -207,7 +222,7 @@ def _apply_weekly_modifier_locked(db: dict) -> str:
     lines = ["🧲 <b>Еженедельное событие войны кланов!</b>", ""]
 
     for rank_index, clan in enumerate(clans_sorted):
-        # --- 1) сжатие очков к среднему ---
+        # --- 1) сжатие очков к среднему (внутри группы) ---
         old_points = clan.get("points", 0)
         new_points = round(old_points + (mean_points - old_points) * config.CONVERGENCE_FACTOR, 2)
         clan["points"] = new_points
@@ -235,8 +250,7 @@ def _apply_weekly_modifier_locked(db: dict) -> str:
 
 
 async def _check_weekly_modifier(bot: Bot) -> None:
-    text = None
-    group_id = None
+    to_send = []
 
     async with Storage() as db:
         season_started = db.get("season_started_at")
@@ -248,17 +262,17 @@ async def _check_weekly_modifier(bot: Bot) -> None:
         if elapsed_since_last < config.WEEKLY_MODIFIER_INTERVAL_DAYS:
             return
 
-        if not db["clans"]:
-            db["last_weekly_modifier_at"] = now()
-            return
+        for chat_id in all_chat_ids(db):
+            chat = get_chat(db, chat_id)
+            text = _apply_weekly_modifier_for_chat(chat)
+            if text:
+                to_send.append((chat_id, text))
 
-        group_id = db.get("group_chat_id")
-        text = _apply_weekly_modifier_locked(db)
         db["last_weekly_modifier_at"] = now()
 
-    if text and group_id:
+    for chat_id, text in to_send:
         try:
-            await bot.send_message(group_id, text, parse_mode="HTML")
+            await bot.send_message(chat_id, text, parse_mode="HTML")
         except Exception:
             pass
 
@@ -266,8 +280,7 @@ async def _check_weekly_modifier(bot: Bot) -> None:
 # --------------------------------------------------- годовой сброс репутации
 
 async def _check_yearly_reputation_reset(bot: Bot) -> None:
-    should_announce = False
-    group_id = None
+    chat_ids_to_notify = []
 
     async with Storage() as db:
         current_year = datetime.datetime.now().year
@@ -278,17 +291,20 @@ async def _check_yearly_reputation_reset(bot: Bot) -> None:
         if last_year == current_year:
             return
 
-        for clan in db["clans"].values():
-            ensure_clan_fields(clan)
-            clan["reputation"] = 0
+        for chat_id in all_chat_ids(db):
+            chat = get_chat(db, chat_id)
+            if not chat["clans"]:
+                continue
+            for clan in chat["clans"].values():
+                ensure_clan_fields(clan)
+                clan["reputation"] = 0
+            chat_ids_to_notify.append(chat_id)
         db["reputation_reset_year"] = current_year
-        group_id = db.get("group_chat_id")
-        should_announce = True
 
-    if should_announce and group_id:
+    for chat_id in chat_ids_to_notify:
         try:
             await bot.send_message(
-                group_id,
+                chat_id,
                 "📆 Наступил новый год — репутация всех кланов обнулена (уровни и достижения сохранены).",
             )
         except Exception:

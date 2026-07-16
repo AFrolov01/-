@@ -2,20 +2,19 @@
 """
 Управление кланом и таблица лидеров.
 
-Добавлено по просьбе владельца:
  - /deleteclan — создатель может расформировать свой клан
  - /kick        — создатель может исключить участника
  - /leaveclan   — рядовой участник может сам покинуть клан
- - /top         — топ кланов и топ игроков ПРЯМО СЕЙЧАС (текущее состояние войны)
- - /resetwar    — (только владелец бота) подводит итоги текущей войны (тот же
-                  текст, что и /top) и начинает новый сезон: очки кланов
-                  сбрасываются к стартовым, серии и счётчики побед обнуляются.
+ - /top         — топ КОНКРЕТНОЙ ГРУППЫ (25 кланов) прямо сейчас
+ - /globaltop   — топ-25 кланов СРЕДИ ВСЕХ ГРУПП, где есть бот
+ - /resetwar    — (только владелец бота) подводит итоги войны КОНКРЕТНОЙ
+                  группы досрочно и начинает новый сезон там
 
-ВАЖНО: сезон войны длится config.SEASON_LENGTH_DAYS (30) дней и завершается
-АВТОМАТИЧЕСКИ фоновой задачей (см. bot/season.py) — итоги публикуются в
-боевой чат сами, вручную ничего нажимать не нужно. Команда /resetwar ниже
-нужна лишь для ручного досрочного завершения (например, если нужно
-перезапустить сезон раньше срока).
+Многие из этих команд можно вызвать и в ЛС боту — тогда группа определяется
+автоматически, если пользователь состоит в клане ровно одной группы;
+если групп несколько (или ни одной) — попросим вызвать команду в нужном чате.
+Callback-кнопки (подтверждения) хранят номер группы прямо в себе, чтобы это
+продолжало работать, даже если сама кнопка пришла в личные сообщения.
 """
 
 from typing import Optional
@@ -27,15 +26,16 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import config
 from bot.storage import Storage, now
+from bot.chat_state import get_chat, resolve_chat_for_message, all_chat_ids
 from bot.keyboards import confirm_kb
-from bot.leaderboard import build_top_text
+from bot.leaderboard import build_top_text, build_global_top_text
 from bot.season import finalize_season_locked
 
 router = Router(name="clan_manage")
 
 
-def _find_user_clan(db: dict, user_id: int) -> Optional[dict]:
-    for clan in db["clans"].values():
+def _find_user_clan(chat: dict, user_id: int) -> Optional[dict]:
+    for clan in chat["clans"].values():
         if str(user_id) in clan.get("members", {}):
             return clan
     return None
@@ -50,7 +50,12 @@ def _display_name(member: dict) -> str:
 @router.message(Command("deleteclan"))
 async def cmd_delete_clan(message: Message) -> None:
     async with Storage() as db:
-        clan = _find_user_clan(db, message.from_user.id)
+        chat_id, error = await resolve_chat_for_message(message, db)
+        if error:
+            await message.reply(error)
+            return
+        chat = get_chat(db, chat_id)
+        clan = _find_user_clan(chat, message.from_user.id)
         if not clan:
             await message.reply("Вы не состоите ни в одном клане.")
             return
@@ -65,7 +70,7 @@ async def cmd_delete_clan(message: Message) -> None:
         "Это действие необратимо: клан и вся его статистика будут удалены, "
         "все участники освободятся и смогут вступить в другой клан.",
         reply_markup=confirm_kb(
-            yes_cb=f"deleteclan:confirm:{clan_id}",
+            yes_cb=f"deleteclan:confirm:{chat_id}:{clan_id}",
             no_cb="deleteclan:cancel",
         ),
     )
@@ -73,9 +78,12 @@ async def cmd_delete_clan(message: Message) -> None:
 
 @router.callback_query(F.data.startswith("deleteclan:confirm:"))
 async def cb_delete_clan_confirm(callback: CallbackQuery) -> None:
-    clan_id = int(callback.data.split(":")[2])
+    _, _, chat_id_s, clan_id_s = callback.data.split(":")
+    chat_id, clan_id = int(chat_id_s), int(clan_id_s)
+
     async with Storage() as db:
-        clan = db["clans"].get(str(clan_id))
+        chat = get_chat(db, chat_id)
+        clan = chat["clans"].get(str(clan_id))
         if not clan:
             await callback.answer("Клан уже удалён.", show_alert=True)
             await callback.message.edit_text("Клан уже был удалён ранее.")
@@ -85,16 +93,16 @@ async def cb_delete_clan_confirm(callback: CallbackQuery) -> None:
             return
 
         clan_name = clan["name"]
-        del db["clans"][str(clan_id)]
+        del chat["clans"][str(clan_id)]
 
         # подчищаем связанные состояния, чтобы не остались "битые" ссылки
-        invite = db.get("pending_invite")
+        invite = chat.get("pending_invite")
         if invite and (invite["clan_a_id"] == clan_id or invite["clan_b_id"] == clan_id):
-            db["pending_invite"] = None
-        for duel_id in list(db["active_duels"].keys()):
-            duel = db["active_duels"][duel_id]
+            chat["pending_invite"] = None
+        for duel_id in list(chat["active_duels"].keys()):
+            duel = chat["active_duels"][duel_id]
             if duel["sides"]["a"]["clan_id"] == clan_id or duel["sides"]["b"]["clan_id"] == clan_id:
-                del db["active_duels"][duel_id]
+                del chat["active_duels"][duel_id]
 
     await callback.message.edit_text(f"🗑 Клан «{clan_name}» расформирован.")
     await callback.answer()
@@ -111,7 +119,12 @@ async def cb_delete_clan_cancel(callback: CallbackQuery) -> None:
 @router.message(Command("kick"))
 async def cmd_kick(message: Message) -> None:
     async with Storage() as db:
-        clan = _find_user_clan(db, message.from_user.id)
+        chat_id, error = await resolve_chat_for_message(message, db)
+        if error:
+            await message.reply(error)
+            return
+        chat = get_chat(db, chat_id)
+        clan = _find_user_clan(chat, message.from_user.id)
         if not clan:
             await message.reply("Вы не состоите ни в одном клане.")
             return
@@ -143,7 +156,7 @@ async def cmd_kick(message: Message) -> None:
         for m in others:
             builder.button(
                 text=f"👢 {_display_name(m)}",
-                callback_data=f"kick:select:{clan['id']}:{m['user_id']}",
+                callback_data=f"kick:select:{chat_id}:{clan['id']}:{m['user_id']}",
             )
         builder.button(text="Отмена", callback_data="kick:cancel")
         builder.adjust(1)
@@ -157,11 +170,12 @@ async def cmd_kick(message: Message) -> None:
 
 @router.callback_query(F.data.startswith("kick:select:"))
 async def cb_kick_select(callback: CallbackQuery) -> None:
-    _, _, clan_id_s, user_id_s = callback.data.split(":")
-    clan_id, target_id = int(clan_id_s), int(user_id_s)
+    _, _, chat_id_s, clan_id_s, user_id_s = callback.data.split(":")
+    chat_id, clan_id, target_id = int(chat_id_s), int(clan_id_s), int(user_id_s)
 
     async with Storage() as db:
-        clan = db["clans"].get(str(clan_id))
+        chat = get_chat(db, chat_id)
+        clan = chat["clans"].get(str(clan_id))
         if not clan:
             await callback.answer("Клан не найден.", show_alert=True)
             return
@@ -191,7 +205,12 @@ async def cb_kick_cancel(callback: CallbackQuery) -> None:
 @router.message(Command("leaveclan"))
 async def cmd_leave_clan(message: Message) -> None:
     async with Storage() as db:
-        clan = _find_user_clan(db, message.from_user.id)
+        chat_id, error = await resolve_chat_for_message(message, db)
+        if error:
+            await message.reply(error)
+            return
+        chat = get_chat(db, chat_id)
+        clan = _find_user_clan(chat, message.from_user.id)
         if not clan:
             await message.reply("Вы не состоите ни в одном клане.")
             return
@@ -212,7 +231,19 @@ async def cmd_leave_clan(message: Message) -> None:
 @router.message(Command("top"))
 async def cmd_top(message: Message) -> None:
     async with Storage() as db:
-        text = build_top_text(db, "📊 <b>Текущее положение войны кланов</b>")
+        chat_id, error = await resolve_chat_for_message(message, db)
+        if error:
+            await message.reply(error)
+            return
+        chat = get_chat(db, chat_id)
+        text = build_top_text(chat, "📊 <b>Топ этой группы</b>")
+    await message.reply(text, parse_mode="HTML")
+
+
+@router.message(Command("globaltop"))
+async def cmd_global_top(message: Message) -> None:
+    async with Storage() as db:
+        text = build_global_top_text(db)
     await message.reply(text, parse_mode="HTML")
 
 
@@ -221,14 +252,20 @@ async def cmd_top(message: Message) -> None:
 @router.message(Command("season"))
 async def cmd_season(message: Message) -> None:
     async with Storage() as db:
-        started = db.get("season_started_at")
+        chat_id, error = await resolve_chat_for_message(message, db)
+        if error:
+            await message.reply(error)
+            return
+        chat = get_chat(db, chat_id)
+        started = chat.get("season_started_at")
+
     if not started:
-        await message.reply("Сезон ещё не начался (запустите бота — отсчёт стартует автоматически).")
+        await message.reply("Сезон ещё не начался (отсчёт стартует автоматически при первом использовании бота).")
         return
     elapsed_days = (now() - started) / 86400
     remaining_days = max(0, config.SEASON_LENGTH_DAYS - elapsed_days)
     await message.reply(
-        f"📅 Текущий сезон идёт {elapsed_days:.1f} из {config.SEASON_LENGTH_DAYS} дней.\n"
+        f"📅 Текущий сезон этой группы идёт {elapsed_days:.1f} из {config.SEASON_LENGTH_DAYS} дней.\n"
         f"⏳ Осталось примерно {remaining_days:.1f} дн. до автоматического подведения итогов."
     )
 
@@ -242,26 +279,33 @@ async def cmd_reset_war(message: Message) -> None:
         return
 
     async with Storage() as db:
-        if not db["clans"]:
-            await message.reply("Кланов пока нет — сбрасывать нечего.")
+        chat_id, error = await resolve_chat_for_message(message, db)
+        if error:
+            await message.reply(error)
+            return
+        chat = get_chat(db, chat_id)
+        if not chat["clans"]:
+            await message.reply("В этой группе кланов пока нет — сбрасывать нечего.")
             return
 
     await message.reply(
-        "⚠️ Это досрочно подведёт итоги текущего сезона и обнулит очки/серии/"
-        "победы всех кланов (новый сезон начнётся заново). Участники и сами "
-        "кланы сохранятся.\nПродолжить?",
-        reply_markup=confirm_kb(yes_cb="resetwar:confirm", no_cb="resetwar:cancel"),
+        "⚠️ Это досрочно подведёт итоги текущего сезона ЭТОЙ ГРУППЫ и обнулит "
+        "очки/серии/победы её кланов (новый сезон начнётся заново). Участники и "
+        "сами кланы сохранятся.\nПродолжить?",
+        reply_markup=confirm_kb(yes_cb=f"resetwar:confirm:{chat_id}", no_cb="resetwar:cancel"),
     )
 
 
-@router.callback_query(F.data == "resetwar:confirm")
+@router.callback_query(F.data.startswith("resetwar:confirm:"))
 async def cb_reset_war_confirm(callback: CallbackQuery) -> None:
     if callback.from_user.id != config.ADMIN_ID:
         await callback.answer("Только владелец бота может это подтвердить.", show_alert=True)
         return
+    chat_id = int(callback.data.split(":")[2])
 
     async with Storage() as db:
-        final_text = finalize_season_locked(db)
+        chat = get_chat(db, chat_id)
+        final_text = finalize_season_locked(chat)
 
     await callback.message.edit_text(final_text + "\n\n🔄 Новый сезон начат!", parse_mode="HTML")
     await callback.answer()

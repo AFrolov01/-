@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Игроки (отдельно от кланов) — хранятся в db["players"][str(user_id)].
+Игроки (отдельно от кланов) — хранятся в chat["players"][str(user_id)], где
+chat — состояние ОДНОЙ конкретной группы (bot/chat_state.py). Своя экономика
+Те/банк/достижения в каждой группе. Параметр функций ниже называется `db` по
+историческим причинам, но по факту принимает именно `chat`.
 
 Структура:
 {
@@ -40,7 +43,8 @@ def _ensure_player_fields(player: dict) -> dict:
     shop = player.setdefault("shop", {})
     for key, default in _SHOP_DEFAULTS.items():
         shop.setdefault(key, default)
-    player.setdefault("bank", {"balance": 0.0, "deposited_at": None})
+    bank = player.setdefault("bank", {"balance": 0.0, "deposited_at": None, "total_interest_earned": 0.0})
+    bank.setdefault("total_interest_earned", 0.0)
     return player
 
 
@@ -61,7 +65,7 @@ def get_or_create_player(db: dict, user_id: int, username: str = "", first_name:
             "achievements": [],
             "shop": dict(_SHOP_DEFAULTS),
             "purchases_count": 0,
-            "bank": {"balance": 0.0, "deposited_at": None},
+            "bank": {"balance": 0.0, "deposited_at": None, "total_interest_earned": 0.0},
         }
         players[uid] = player
     else:
@@ -164,6 +168,29 @@ def bank_current_balance(player: dict) -> float:
     days_passed = (time.time() - deposited_at) / 86400
     grown = balance * ((1 + config.BANK_DAILY_RATE) ** days_passed)
     return round(grown, 2)
+
+
+def bank_total_interest_earned(player: dict) -> float:
+    """Сколько ВСЕГО процентов накапало с самого первого вклада (не сбрасывается
+    при пополнении/снятии — в отличие от текущего баланса, это честный счётчик
+    "сколько банк вам заработал" за всё время)."""
+    bank = player.get("bank", {})
+    settled = bank.get("total_interest_earned", 0.0)
+    live_growth = bank_current_balance(player) - bank.get("balance", 0.0)
+    return round(settled + live_growth, 2)
+
+
+def bank_settle(player: dict) -> None:
+    """Фиксирует накопленный за текущий период процент в общий счётчик
+    total_interest_earned и обновляет 'принцип' (balance) до текущей
+    выросшей суммы — вызывать ПЕРЕД любым изменением суммы вклада
+    (пополнение/снятие), чтобы проценты не терялись и не обнулялись в
+    отображении."""
+    bank = player.setdefault("bank", {"balance": 0.0, "deposited_at": None, "total_interest_earned": 0.0})
+    current_balance = bank_current_balance(player)
+    growth = current_balance - bank.get("balance", 0.0)
+    bank["total_interest_earned"] = round(bank.get("total_interest_earned", 0.0) + growth, 2)
+    bank["balance"] = current_balance
 
 
 def bank_days_left_to_withdraw(player: dict) -> float:

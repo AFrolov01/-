@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Магазин привилегий за валюту Те.
+Магазин привилегий за валюту Те (своя экономика в каждой группе).
 
 Трактовка неочевидных пунктов ТЗ:
  - "вице" (ачивка «Это... Конец?») трактуется как покупка привилегии
@@ -9,11 +9,11 @@
  - "проголосовать за исключение игрока/участника группы" реализовано как
    простое голосование прямо в чате (нужно 3 голоса «за» в течение 10 минут),
    а не полноценная система прав вице-президента.
- - "поменять название клана/группы" — запрашивает новое название следующим
+ - "поменять название клана" — запрашивает новое название следующим
    сообщением (FSM), устанавливает сразу после покупки.
 """
 
-from aiogram import Router, F, Bot
+from aiogram import Router, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -22,6 +22,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import config
 from bot.storage import Storage, now
+from bot.chat_state import get_chat, resolve_chat_for_message
 from bot import players
 from bot.clan_utils import ensure_clan_fields
 from bot.fsm_utils import check_command_escape
@@ -34,11 +35,10 @@ VOTE_KICK_WINDOW_SECONDS = 600
 
 class ShopRename(StatesGroup):
     waiting_clan_name = State()
-    waiting_group_name = State()
 
 
-def _find_user_clan(db: dict, user_id: int):
-    for clan in db["clans"].values():
+def _find_user_clan(chat: dict, user_id: int):
+    for clan in chat["clans"].values():
         if str(user_id) in clan.get("members", {}):
             return clan
     return None
@@ -47,8 +47,13 @@ def _find_user_clan(db: dict, user_id: int):
 @router.message(Command("shop"))
 async def cmd_shop(message: Message) -> None:
     async with Storage() as db:
+        chat_id, error = await resolve_chat_for_message(message, db)
+        if error:
+            await message.reply(error)
+            return
+        chat = get_chat(db, chat_id)
         player = players.get_or_create_player(
-            db, message.from_user.id, message.from_user.username or "", message.from_user.first_name or "Игрок"
+            chat, message.from_user.id, message.from_user.username or "", message.from_user.first_name or "Игрок"
         )
         balance = player.get("currency", 0.0)
 
@@ -56,7 +61,7 @@ async def cmd_shop(message: Message) -> None:
     lines = [f"🛒 <b>Магазин привилегий</b>\n💰 Ваш баланс: {balance:.2f} Те\n"]
     for key, (price, desc) in config.SHOP_ITEMS.items():
         lines.append(f"• {price} Те — {desc}")
-        builder.button(text=f"{price} Те: {desc[:28]}...", callback_data=f"shop:buy:{key}")
+        builder.button(text=f"{price} Те: {desc[:28]}...", callback_data=f"shop:buy:{chat_id}:{key}")
     builder.adjust(1)
 
     await message.reply("\n".join(lines), parse_mode="HTML", reply_markup=builder.as_markup())
@@ -64,7 +69,8 @@ async def cmd_shop(message: Message) -> None:
 
 @router.callback_query(F.data.startswith("shop:buy:"))
 async def cb_shop_buy(callback: CallbackQuery, state: FSMContext) -> None:
-    key = callback.data.split(":")[2]
+    _, _, chat_id_s, key = callback.data.split(":")
+    chat_id = int(chat_id_s)
     item = config.SHOP_ITEMS.get(key)
     if not item:
         await callback.answer("Такой привилегии не существует.", show_alert=True)
@@ -72,8 +78,9 @@ async def cb_shop_buy(callback: CallbackQuery, state: FSMContext) -> None:
     price, desc = item
 
     async with Storage() as db:
+        chat = get_chat(db, chat_id)
         player = players.get_or_create_player(
-            db, callback.from_user.id, callback.from_user.username or "", callback.from_user.first_name or "Игрок"
+            chat, callback.from_user.id, callback.from_user.username or "", callback.from_user.first_name or "Игрок"
         )
         if player.get("currency", 0.0) < price:
             await callback.answer(
@@ -83,8 +90,9 @@ async def cb_shop_buy(callback: CallbackQuery, state: FSMContext) -> None:
 
         # для покупок, требующих активной дуэли или проверки прав, проверяем ДО списания валюты
         duel, side_key = None, None
+        buyer_clan = None
         if key == "forfeit_duel_bonus":
-            for d in db["active_duels"].values():
+            for d in chat["active_duels"].values():
                 for sk in ("a", "b"):
                     if d["sides"][sk]["player_id"] == callback.from_user.id and d["sides"][sk]["stage"] in (
                         "choose_mines", "playing"
@@ -94,7 +102,7 @@ async def cb_shop_buy(callback: CallbackQuery, state: FSMContext) -> None:
                 await callback.answer("У вас сейчас нет активной дуэли, которую можно завершить.", show_alert=True)
                 return
         elif key == "change_tactic":
-            buyer_clan = _find_user_clan(db, callback.from_user.id)
+            buyer_clan = _find_user_clan(chat, callback.from_user.id)
             if not buyer_clan:
                 await callback.answer("Вы не состоите ни в одном клане.", show_alert=True)
                 return
@@ -130,7 +138,7 @@ async def cb_shop_buy(callback: CallbackQuery, state: FSMContext) -> None:
         elif key == "forfeit_duel_bonus":
             duel["sides"][side_key]["stage"] = "done"
             duel["sides"][side_key]["result"] = "win"
-            clan = db["clans"].get(str(duel["sides"][side_key]["clan_id"]))
+            clan = chat["clans"].get(str(duel["sides"][side_key]["clan_id"]))
             if clan:
                 ensure_clan_fields(clan)
                 clan["points"] = round(clan.get("points", 0) * 1.1, 2)
@@ -157,13 +165,12 @@ async def cb_shop_buy(callback: CallbackQuery, state: FSMContext) -> None:
         elif key == "change_tactic":
             buyer_clan["tactic_locked"] = False
             effect_text = "Готово — блокировка снята, используйте /tactic, чтобы выбрать новую тактику."
-        elif key in ("rename_clan", "rename_group"):
+        elif key == "rename_clan":
             effect_text = "Напишите новое название следующим сообщением."
 
     if key == "rename_clan":
+        await state.update_data(chat_id=chat_id)
         await state.set_state(ShopRename.waiting_clan_name)
-    elif key == "rename_group":
-        await state.set_state(ShopRename.waiting_group_name)
 
     await callback.message.edit_text(f"✅ Куплено: {desc}\n{effect_text}", parse_mode="HTML")
     await callback.answer()
@@ -184,8 +191,11 @@ async def process_rename_clan(message: Message, state: FSMContext) -> None:
     if not new_name or len(new_name) > 40:
         await message.reply("Название должно быть от 1 до 40 символов. Попробуйте ещё раз:")
         return
+    data = await state.get_data()
+    chat_id = data.get("chat_id")
     async with Storage() as db:
-        clan = _find_user_clan(db, message.from_user.id)
+        chat = get_chat(db, chat_id)
+        clan = _find_user_clan(chat, message.from_user.id)
         if not clan:
             await state.clear()
             await message.reply("Вы больше не состоите в клане.")
@@ -196,36 +206,21 @@ async def process_rename_clan(message: Message, state: FSMContext) -> None:
     await message.reply(f"✅ Клан «{old_name}» переименован в «{new_name}».")
 
 
-@router.message(StateFilter(ShopRename.waiting_group_name))
-async def process_rename_group(message: Message, state: FSMContext, bot: Bot) -> None:
-    if await check_command_escape(message, state):
-        return
-    new_name = (message.text or "").strip()
-    if not new_name or len(new_name) > 128:
-        await message.reply("Название должно быть от 1 до 128 символов. Попробуйте ещё раз:")
-        return
-    await state.clear()
-    try:
-        await bot.set_chat_title(message.chat.id, new_name)
-        await message.reply(f"✅ Группа переименована в «{new_name}».")
-    except Exception:
-        await message.reply(
-            "⚠️ Не получилось переименовать группу — убедитесь, что бот является "
-            "администратором с правом менять информацию о группе."
-        )
-
-
 # ------------------------------------------------------------- /votekick ---
 
 @router.message(Command("votekick"))
 async def cmd_votekick(message: Message) -> None:
+    if message.chat.type not in ("group", "supergroup"):
+        await message.reply("Исключить можно только из группы — вызовите /votekick прямо там.")
+        return
     if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.reply("Ответьте этой командой на сообщение участника, которого хотите исключить из группы.")
         return
 
     target = message.reply_to_message.from_user
     async with Storage() as db:
-        player = players.find_player(db, message.from_user.id)
+        chat = get_chat(db, message.chat.id)
+        player = players.find_player(chat, message.from_user.id)
         tokens = player.get("shop", {}).get("vote_kick_tokens", 0) if player else 0
         if tokens <= 0:
             await message.reply("У вас нет купленного голоса за исключение (см. /shop).")
@@ -233,7 +228,7 @@ async def cmd_votekick(message: Message) -> None:
         player["shop"]["vote_kick_tokens"] -= 1
 
         vote_id = str(int(now() * 1000))
-        db.setdefault("active_votes", {})[vote_id] = {
+        chat.setdefault("active_votes", {})[vote_id] = {
             "target_id": target.id,
             "target_name": target.username or target.first_name,
             "chat_id": message.chat.id,
@@ -242,7 +237,10 @@ async def cmd_votekick(message: Message) -> None:
         }
 
     builder = InlineKeyboardBuilder()
-    builder.button(text=f"✅ Голосовать за исключение (1/{VOTE_KICK_THRESHOLD})", callback_data=f"votekick:{vote_id}")
+    builder.button(
+        text=f"✅ Голосовать за исключение (1/{VOTE_KICK_THRESHOLD})",
+        callback_data=f"votekick:{message.chat.id}:{vote_id}",
+    )
     await message.reply(
         f"🗳 Голосование: исключить @{target.username or target.first_name} из группы?\n"
         f"Нужно {VOTE_KICK_THRESHOLD} голосов «за» в течение {VOTE_KICK_WINDOW_SECONDS // 60} минут.",
@@ -251,18 +249,20 @@ async def cmd_votekick(message: Message) -> None:
 
 
 @router.callback_query(F.data.startswith("votekick:"))
-async def cb_votekick(callback: CallbackQuery, bot: Bot) -> None:
-    vote_id = callback.data.split(":")[1]
+async def cb_votekick(callback: CallbackQuery, bot) -> None:
+    _, chat_id_s, vote_id = callback.data.split(":")
+    chat_id = int(chat_id_s)
 
     kick_target = None
     count = 0
     async with Storage() as db:
-        vote = db.get("active_votes", {}).get(vote_id)
+        chat = get_chat(db, chat_id)
+        vote = chat.get("active_votes", {}).get(vote_id)
         if not vote:
             await callback.answer("Голосование уже завершено.", show_alert=True)
             return
         if now() - vote["created_at"] > VOTE_KICK_WINDOW_SECONDS:
-            del db["active_votes"][vote_id]
+            del chat["active_votes"][vote_id]
             await callback.answer("Время голосования истекло.", show_alert=True)
             return
         if callback.from_user.id in vote["voters"]:
@@ -272,21 +272,20 @@ async def cb_votekick(callback: CallbackQuery, bot: Bot) -> None:
         count = len(vote["voters"])
 
         if count >= VOTE_KICK_THRESHOLD:
-            target_player = players.find_player(db, vote["target_id"])
+            target_player = players.find_player(chat, vote["target_id"])
             shield = target_player.get("shop", {}).get("avoid_punishment", 0) if target_player else 0
             if shield > 0:
                 target_player["shop"]["avoid_punishment"] -= 1
-                del db["active_votes"][vote_id]
-                shielded = vote["target_name"]
+                del chat["active_votes"][vote_id]
             else:
                 kick_target = (vote["chat_id"], vote["target_id"], vote["target_name"])
-                del db["active_votes"][vote_id]
+                del chat["active_votes"][vote_id]
 
     if kick_target:
-        chat_id, target_id, target_name = kick_target
+        target_chat_id, target_id, target_name = kick_target
         try:
-            await bot.ban_chat_member(chat_id, target_id)
-            await bot.unban_chat_member(chat_id, target_id)  # кик, а не бан навсегда
+            await bot.ban_chat_member(target_chat_id, target_id)
+            await bot.unban_chat_member(target_chat_id, target_id)  # кик, а не бан навсегда
             await callback.message.edit_text(f"👢 @{target_name} исключён(а) из группы по голосованию.")
         except Exception:
             await callback.message.edit_text(
@@ -298,7 +297,7 @@ async def cb_votekick(callback: CallbackQuery, bot: Bot) -> None:
             builder = InlineKeyboardBuilder()
             builder.button(
                 text=f"✅ Голосовать за исключение ({count}/{VOTE_KICK_THRESHOLD})",
-                callback_data=f"votekick:{vote_id}",
+                callback_data=f"votekick:{chat_id}:{vote_id}",
             )
             await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
         except Exception:

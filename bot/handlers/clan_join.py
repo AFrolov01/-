@@ -4,13 +4,14 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InputMediaPhoto
 
 from bot.storage import Storage
+from bot.chat_state import get_chat
 from bot.keyboards import clan_carousel_kb
 
 router = Router(name="clan_join")
 
 
-def _user_already_in_clan(db: dict, user_id: int) -> bool:
-    for clan in db["clans"].values():
+def _user_already_in_clan(chat: dict, user_id: int) -> bool:
+    for clan in chat["clans"].values():
         if str(user_id) in clan.get("members", {}):
             return True
     return False
@@ -28,7 +29,7 @@ def _clan_card_text(clan: dict) -> str:
 
 async def _render_card(callback_or_message, clans: list, index: int, edit: bool) -> None:
     if not clans:
-        text = "Пока нет ни одного клана. Создайте свой командой /createclan!"
+        text = "Пока нет ни одного клана в этой группе. Создайте свой командой /createclan!"
         if edit:
             await callback_or_message.message.edit_text(text)
         else:
@@ -64,11 +65,19 @@ async def _render_card(callback_or_message, clans: list, index: int, edit: bool)
 
 @router.message(Command("join"))
 async def cmd_join(message: Message) -> None:
+    if message.chat.type not in ("group", "supergroup"):
+        await message.reply(
+            "Вступить в клан можно только внутри группы — у каждой группы своя "
+            "независимая война. Вызовите /join прямо в нужном чате."
+        )
+        return
+
     async with Storage() as db:
-        if _user_already_in_clan(db, message.from_user.id):
+        chat = get_chat(db, message.chat.id)
+        if _user_already_in_clan(chat, message.from_user.id):
             await message.reply("Вы уже состоите в клане.")
             return
-        clans = sorted(db["clans"].values(), key=lambda c: c["id"])
+        clans = sorted(chat["clans"].values(), key=lambda c: c["id"])
     await _render_card(message, clans, 0, edit=False)
 
 
@@ -76,7 +85,8 @@ async def cmd_join(message: Message) -> None:
 async def cb_prev(callback: CallbackQuery) -> None:
     index = int(callback.data.split(":")[2])
     async with Storage() as db:
-        clans = sorted(db["clans"].values(), key=lambda c: c["id"])
+        chat = get_chat(db, callback.message.chat.id)
+        clans = sorted(chat["clans"].values(), key=lambda c: c["id"])
     await _render_card(callback, clans, index - 1, edit=True)
     await callback.answer()
 
@@ -85,7 +95,8 @@ async def cb_prev(callback: CallbackQuery) -> None:
 async def cb_next(callback: CallbackQuery) -> None:
     index = int(callback.data.split(":")[2])
     async with Storage() as db:
-        clans = sorted(db["clans"].values(), key=lambda c: c["id"])
+        chat = get_chat(db, callback.message.chat.id)
+        clans = sorted(chat["clans"].values(), key=lambda c: c["id"])
     await _render_card(callback, clans, index + 1, edit=True)
     await callback.answer()
 
@@ -97,10 +108,11 @@ async def cb_select(callback: CallbackQuery) -> None:
     user = callback.from_user
 
     async with Storage() as db:
-        if _user_already_in_clan(db, user.id):
+        chat = get_chat(db, callback.message.chat.id)
+        if _user_already_in_clan(chat, user.id):
             await callback.answer("Вы уже состоите в клане.", show_alert=True)
             return
-        clan = db["clans"].get(str(clan_id))
+        clan = chat["clans"].get(str(clan_id))
         if not clan:
             await callback.answer("Этот клан больше не существует.", show_alert=True)
             return
