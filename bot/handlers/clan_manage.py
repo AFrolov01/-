@@ -34,6 +34,200 @@ from bot.season import finalize_season_locked
 router = Router(name="clan_manage")
 
 
+# ------------------------------------------------------------------ /tixa --
+# Тихий режим: короткие уведомления о дуэлях (без длинных пояснений и без
+# закрепления), вызов на дуэль отвечается словом "начать" в ЛС боту.
+# Включать/выключать может только владелец группы (Telegram-статус "creator").
+
+@router.message(Command("tixa"))
+async def cmd_tixa(message: Message) -> None:
+    if message.chat.type not in ("group", "supergroup"):
+        await message.reply("Эту команду нужно вызвать прямо в группе.")
+        return
+
+    try:
+        member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
+    except Exception:
+        member = None
+
+    if not member or member.status != "creator":
+        await message.reply("🔒 Тихий режим может включать/выключать только владелец группы.")
+        return
+
+    async with Storage() as db:
+        chat = get_chat(db, message.chat.id)
+        chat["silent_mode"] = not chat.get("silent_mode", False)
+        enabled = chat["silent_mode"]
+
+    if enabled:
+        await message.reply(
+            "🔇 Тихий режим включён. Вызовы на дуэль теперь короткие, без закрепления — "
+            "чтобы начать, вызванным нужно написать боту в ЛС «начать»."
+        )
+    else:
+        await message.reply("🔊 Тихий режим выключен — вызовы на дуэль снова подробные и закрепляются.")
+
+
+# --------------------------------------------------------------- /settingclan -
+# Раньше это были 4 разные команды (/leaveclan, /kick, /deleteclan, /tactic) —
+# по просьбе слишком много команд, теперь всё это под одной командой с меню
+# 2×2, а дальше уже открывается конкретное подменю/подтверждение.
+
+@router.message(Command("settingclan"))
+async def cmd_setting_clan(message: Message) -> None:
+    async with Storage() as db:
+        chat_id, error = await resolve_chat_for_message(message, db)
+        if error:
+            await message.reply(error)
+            return
+        chat = get_chat(db, chat_id)
+        clan = _find_user_clan(chat, message.from_user.id)
+        if not clan:
+            await message.reply("Вы не состоите ни в одном клане. Вступить: /join, создать: /createclan.")
+            return
+        clan_id = clan["id"]
+        clan_name = clan["name"]
+        is_creator = clan["creator_id"] == message.from_user.id
+
+    builder = InlineKeyboardBuilder()
+    if is_creator:
+        builder.button(text="👢 Кикнуть участника", callback_data=f"settingclan:kick:{chat_id}:{clan_id}")
+        builder.button(text="🗑 Расформировать клан", callback_data=f"settingclan:delete:{chat_id}:{clan_id}")
+    else:
+        builder.button(text="🚪 Покинуть клан", callback_data=f"settingclan:leave:{chat_id}:{clan_id}")
+    builder.button(text="⚔️ Тактика клана", callback_data=f"settingclan:tactic:{chat_id}:{clan_id}")
+    builder.adjust(2)
+
+    await message.reply(
+        f"⚙️ <b>Настройки клана «{clan_name}»</b>\nВыберите действие:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("settingclan:leave:"))
+async def cb_settingclan_leave(callback: CallbackQuery) -> None:
+    _, _, chat_id_s, clan_id_s = callback.data.split(":")
+    chat_id, clan_id = int(chat_id_s), int(clan_id_s)
+
+    async with Storage() as db:
+        chat = get_chat(db, chat_id)
+        clan = chat["clans"].get(str(clan_id))
+        if not clan or str(callback.from_user.id) not in clan.get("members", {}):
+            await callback.answer("Вы уже не в этом клане.", show_alert=True)
+            return
+        if clan["creator_id"] == callback.from_user.id:
+            await callback.answer("Вы создатель — используйте «Расформировать клан».", show_alert=True)
+            return
+        del clan["members"][str(callback.from_user.id)]
+        clan_name = clan["name"]
+
+    await callback.message.edit_text(f"🚪 Вы покинули клан «{clan_name}». Вступить в другой: /join.")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("settingclan:kick:"))
+async def cb_settingclan_kick(callback: CallbackQuery) -> None:
+    _, _, chat_id_s, clan_id_s = callback.data.split(":")
+    chat_id, clan_id = int(chat_id_s), int(clan_id_s)
+
+    async with Storage() as db:
+        chat = get_chat(db, chat_id)
+        clan = chat["clans"].get(str(clan_id))
+        if not clan:
+            await callback.answer("Клан не найден.", show_alert=True)
+            return
+        if clan["creator_id"] != callback.from_user.id:
+            await callback.answer("Исключать участников может только создатель клана.", show_alert=True)
+            return
+        others = [m for m in clan["members"].values() if m["user_id"] != clan["creator_id"]]
+        if not others:
+            await callback.answer("В клане нет участников, кроме вас.", show_alert=True)
+            return
+
+        builder = InlineKeyboardBuilder()
+        for m in others:
+            builder.button(
+                text=f"👢 {_display_name(m)}",
+                callback_data=f"kick:select:{chat_id}:{clan['id']}:{m['user_id']}",
+            )
+        builder.button(text="Отмена", callback_data="kick:cancel")
+        builder.adjust(1)
+
+    await callback.message.edit_text("Кого исключить из клана?", reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("settingclan:delete:"))
+async def cb_settingclan_delete(callback: CallbackQuery) -> None:
+    _, _, chat_id_s, clan_id_s = callback.data.split(":")
+    chat_id, clan_id = int(chat_id_s), int(clan_id_s)
+
+    async with Storage() as db:
+        chat = get_chat(db, chat_id)
+        clan = chat["clans"].get(str(clan_id))
+        if not clan:
+            await callback.answer("Клан не найден.", show_alert=True)
+            return
+        if clan["creator_id"] != callback.from_user.id:
+            await callback.answer("Расформировать может только создатель клана.", show_alert=True)
+            return
+        clan_name = clan["name"]
+
+    await callback.message.edit_text(
+        f"⚠️ Вы уверены, что хотите расформировать клан «{clan_name}»?\n"
+        "Это действие необратимо: клан и вся его статистика будут удалены, "
+        "все участники освободятся и смогут вступить в другой клан.",
+        reply_markup=confirm_kb(
+            yes_cb=f"deleteclan:confirm:{chat_id}:{clan_id}",
+            no_cb="deleteclan:cancel",
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("settingclan:tactic:"))
+async def cb_settingclan_tactic(callback: CallbackQuery) -> None:
+    from bot.handlers.tactics import TACTIC_DESCRIPTIONS
+    from bot.clan_utils import ensure_clan_fields
+
+    _, _, chat_id_s, clan_id_s = callback.data.split(":")
+    chat_id, clan_id = int(chat_id_s), int(clan_id_s)
+
+    async with Storage() as db:
+        chat = get_chat(db, chat_id)
+        clan = chat["clans"].get(str(clan_id))
+        if not clan:
+            await callback.answer("Клан не найден.", show_alert=True)
+            return
+        if clan["creator_id"] != callback.from_user.id:
+            await callback.answer("Тактику сезона выбирает только создатель клана.", show_alert=True)
+            return
+        ensure_clan_fields(clan)
+        if clan.get("tactic_locked"):
+            name = config.SEASON_TACTICS.get(clan.get("tactic"), clan.get("tactic"))
+            await callback.message.edit_text(
+                f"Тактика на этот сезон уже выбрана: <b>{name}</b>.\n"
+                "Сменить её можно будет только в начале следующего сезона.",
+                parse_mode="HTML",
+            )
+            await callback.answer()
+            return
+
+    builder = InlineKeyboardBuilder()
+    for key, name in config.SEASON_TACTICS.items():
+        builder.button(text=name, callback_data=f"tactic:set:{chat_id}:{clan_id}:{key}")
+    builder.adjust(1)
+
+    descriptions = "\n\n".join(TACTIC_DESCRIPTIONS.values())
+    await callback.message.edit_text(
+        f"⚔️ Выберите тактику клана на этот сезон:\n\n{descriptions}",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
 def _find_user_clan(chat: dict, user_id: int) -> Optional[dict]:
     for clan in chat["clans"].values():
         if str(user_id) in clan.get("members", {}):
@@ -256,8 +450,11 @@ async def cmd_season(message: Message) -> None:
         if error:
             await message.reply(error)
             return
-        chat = get_chat(db, chat_id)
-        started = chat.get("season_started_at")
+        # ВАЖНО: сезон общий для всех групп и хранится в db["season_started_at"]
+        # (см. bot/season.py и схему в bot/storage.py), а НЕ внутри chat —
+        # раньше здесь по ошибке читали chat.get(...), что всегда давало None
+        # и /season сообщал "сезон ещё не начался", даже если он давно идёт.
+        started = db.get("season_started_at")
 
     if not started:
         await message.reply("Сезон ещё не начался (отсчёт стартует автоматически при первом использовании бота).")

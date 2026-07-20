@@ -4,6 +4,32 @@
 from config import LOSS_MULTIPLIER
 
 
+def fmt_num(x: float) -> str:
+    """Число с разделением тысяч пробелом и запятой вместо точки для дробной
+    части (русская типографика): 151728 -> '151 728', 3450.5 -> '3 450,5'."""
+    x = round(float(x), 2)
+    sign = "−" if x < 0 else ""
+    x = abs(x)
+    if x == int(x):
+        int_part, frac = str(int(x)), ""
+    else:
+        s = f"{x:.2f}".rstrip("0").rstrip(".")
+        if "." in s:
+            int_part, frac_digits = s.split(".")
+            frac = "," + frac_digits
+        else:
+            int_part, frac = s, ""
+    grouped = f"{int(int_part):,}".replace(",", " ")
+    return f"{sign}{grouped}{frac}"
+
+
+def fmt_signed_num(x: float) -> str:
+    """Как fmt_num, но всегда с явным знаком (+123 / −123 / 0)."""
+    if x > 0:
+        return f"+{fmt_num(x)}"
+    return fmt_num(x)  # fmt_num уже подставляет "−" для отрицательных
+
+
 def duel_invite_text(name_a: str, name_b: str) -> str:
     return (
         "⚔️ <b>Вызов на дуэль чести!</b>\n\n"
@@ -12,6 +38,11 @@ def duel_invite_text(name_a: str, name_b: str) -> str:
         "Любому из вас двоих достаточно нажать /minduel — дуэль откроется "
         "сразу для обоих, второй раз жать команду не нужно."
     )
+
+
+def duel_invite_text_silent(name_a: str, name_b: str) -> str:
+    """Короткий вариант для тихого режима (/tixa) — без длинных пояснений."""
+    return f"⚔️ {name_a} и {name_b} вызваны на дуэль. Напишите в ЛС боту «начать», чтобы вызвать поле."
 
 
 def duel_rules_text(clan_a_name: str, clan_a_points: float, clan_b_name: str, clan_b_points: float) -> str:
@@ -87,24 +118,30 @@ def lose_text(clan_name: str, old_points: float, new_points: float, possible_mul
     )
 
 
-def cashout_text(clan_name: str, multiplier: float, won_al: int, new_points: float, weekly_pct: int = 0, base_al: int = None, grapes_note: str = "", tactic_note: str = "") -> str:
-    text = (
-        "✅ <b>Вы забрали выигрыш!</b>\n"
-        f"Множитель: x{multiplier:.2f}".replace(".", ",") + f" ({won_al} Al)\n"
-    )
-    if tactic_note:
-        text += tactic_note + "\n"
-    if weekly_pct and base_al is not None and base_al != won_al:
-        sign = "+" if weekly_pct > 0 else ""
-        diff = won_al - base_al
-        diff_sign = "+" if diff >= 0 else ""
-        text += (
-            f"📉 Недельный {'бафф' if weekly_pct > 0 else 'дебафф'} клана: {sign}{weekly_pct}% "
-            f"→ без него было бы {base_al} Al ({diff_sign}{diff} Al)\n"
-        )
-    if grapes_note:
-        text += grapes_note + "\n"
-    text += f"Очки клана «{clan_name}» обновлены: <b>{new_points:g}</b>"
+def breakdown_base_line(multiplier: float, stake: int, base_al: int) -> str:
+    mult_s = f"x{multiplier:.2f}".replace(".", ",")
+    return f"🎯 Поле: {mult_s} на {fmt_num(stake)} = {fmt_num(base_al)} очков"
+
+
+def breakdown_bonus_line(label: str, emoji: str, amount: float) -> str:
+    sign = "+" if amount >= 0 else ""
+    return f"{emoji} {label} приносит {sign}{fmt_num(amount)} очков"
+
+
+def breakdown_item_line(label: str, emoji: str, amount: float, success: bool) -> str:
+    if success:
+        return f"{emoji} {label} сработали! Бонус к очкам: +{fmt_num(amount)} очков"
+    return f"{emoji} {label} не выпали — дебаф к очкам: {fmt_num(amount)} очков"
+
+
+def cashout_text(clan_name: str, breakdown_lines: list, won_al: int, new_points: float) -> str:
+    """`breakdown_lines` — уже готовые строки по шагам (база, тактика,
+    привилегии, недельные срезы, личные предметы) в фиксированном порядке
+    применения бонусов — см. bot/handlers/duel.py::_apply_cashout."""
+    text = "✅ <b>Вы забрали выигрыш!</b>\n\n"
+    text += "\n".join(breakdown_lines)
+    text += f"\n\n💰 Итого очков: <b>{fmt_num(won_al)}</b>"
+    text += f"\n🏳️ Очки клана «{clan_name}» обновлены: <b>{fmt_num(new_points)}</b>"
     return text
 
 

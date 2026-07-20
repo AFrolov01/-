@@ -28,19 +28,16 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="createclan", description="Создать клан"),
         BotCommand(command="join", description="Вступить в клан"),
         BotCommand(command="clan", description="Информация о моём клане"),
-        BotCommand(command="leaveclan", description="Покинуть клан"),
-        BotCommand(command="kick", description="Исключить участника (создатель клана)"),
-        BotCommand(command="deleteclan", description="Расформировать клан (создатель)"),
-        BotCommand(command="tactic", description="Выбрать тактику клана на сезон"),
+        BotCommand(command="settingclan", description="Управление кланом: покинуть/кикнуть/расформировать/тактика"),
         BotCommand(command="shop", description="Магазин привилегий за Те"),
-        BotCommand(command="bank", description="Банк — внести Те под процент"),
-        BotCommand(command="bank_snyat", description="Снять деньги со вклада в банке"),
+        BotCommand(command="bank", description="Банк — внести/снять Те под процент"),
         BotCommand(command="iam", description="Мой профиль"),
         BotCommand(command="top", description="Топ кланов этой группы"),
         BotCommand(command="globaltop", description="Топ кланов среди всех групп"),
         BotCommand(command="season", description="Сколько дней осталось до конца сезона"),
         BotCommand(command="online", description="Сколько групп и игроков используют бота"),
         BotCommand(command="minduel", description="Начать назначенную дуэль"),
+        BotCommand(command="tixa", description="Тихий режим дуэлей (только владелец группы)"),
     ])
 
 

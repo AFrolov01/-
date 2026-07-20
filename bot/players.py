@@ -194,12 +194,9 @@ def bank_settle(player: dict) -> None:
 
 
 def bank_days_left_to_withdraw(player: dict) -> float:
-    bank = player.get("bank", {})
-    deposited_at = bank.get("deposited_at")
-    if not deposited_at:
-        return 0.0
-    elapsed_days = (time.time() - deposited_at) / 86400
-    return max(0.0, config.BANK_MIN_HOLD_DAYS - elapsed_days)
+    # Снятие теперь доступно в любой момент, без ожидания — оставлено для
+    # обратной совместимости вызовов, всегда возвращает 0.
+    return 0.0
 
 
 def average_multiplier_all_time(player: dict) -> float:

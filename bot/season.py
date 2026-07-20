@@ -209,6 +209,8 @@ def _apply_weekly_modifier_for_chat(chat: dict) -> str:
     1) сжатие текущих очков клана к среднему ПО СВОЕЙ ГРУППЕ (10%);
     2) отдельно — накопительный %-бонус/штраф к БУДУЩИМ очкам из раундов мин,
        зависящий от места в рейтинге СВОЕЙ ГРУППЫ (или от тактики "Тихо не спеша")."""
+    from bot.texts import fmt_num
+
     clans = list(chat["clans"].values())
     for clan in clans:
         ensure_clan_fields(clan)
@@ -219,15 +221,19 @@ def _apply_weekly_modifier_for_chat(chat: dict) -> str:
     total = len(clans_sorted)
     mean_points = sum(c.get("points", 0) for c in clans) / total
 
-    lines = ["🧲 <b>Еженедельное событие войны кланов!</b>", ""]
+    lines = [
+        "🧲 <b>Еженедельное событие войны кланов!</b>",
+        "Очки приведены к среднему по группе, бонус к будущим очкам обновлён.",
+        "",
+    ]
 
     for rank_index, clan in enumerate(clans_sorted):
         # --- 1) сжатие очков к среднему (внутри группы) ---
         old_points = clan.get("points", 0)
         new_points = round(old_points + (mean_points - old_points) * config.CONVERGENCE_FACTOR, 2)
         clan["points"] = new_points
-        points_delta = new_points - old_points
-        pts_sign = "+" if points_delta >= 0 else ""
+        points_delta = round(new_points - old_points, 2)
+        pts_sign = "+" if points_delta >= 0 else "−"
 
         # --- 2) накопительный %-бонус к будущим очкам ---
         if clan.get("tactic") == "quiet":
@@ -235,18 +241,26 @@ def _apply_weekly_modifier_for_chat(chat: dict) -> str:
         else:
             delta_pct = _rank_based_percent(rank_index, total)
 
+        had_previous_snapshot = clan.get("weekly_snapshots_done", 0) > 0
         old_mod = clan.get("weekly_percent_modifier", 0)
         new_mod = round(old_mod + delta_pct, 1)
         clan["weekly_percent_modifier"] = new_mod
-        pct_sign = "+" if delta_pct >= 0 else ""
-        total_pct_sign = "+" if new_mod >= 0 else ""
+        clan["weekly_snapshots_done"] = clan.get("weekly_snapshots_done", 0) + 1
 
-        lines.append(
-            f"«{clan['name']}»: очки {old_points:g} → {new_points:g} ({pts_sign}{points_delta:.1f}) | "
-            f"бонус к будущим очкам {pct_sign}{delta_pct:.0f}% → итого {total_pct_sign}{new_mod:g}%"
-        )
+        arrow = "🔺" if new_mod > 0 else ("🔻" if new_mod < 0 else "▪️")
+        new_mod_s = f"{'+' if new_mod > 0 else ''}{new_mod:g}%"
+        if had_previous_snapshot:
+            old_mod_s = f"{'+' if old_mod > 0 else ''}{old_mod:g}%"
+            bonus_line = f"🔮 бонус к очкам: {old_mod_s} → {new_mod_s} {arrow}"
+        else:
+            bonus_line = f"🔮 бонус к очкам: {new_mod_s} (первый срез для этого клана) {arrow}"
 
-    return "\n".join(lines)
+        lines.append(f"▫️ {clan['name']}")
+        lines.append(f"📊 {fmt_num(old_points)} → {fmt_num(new_points)} ({pts_sign}{fmt_num(abs(points_delta))})")
+        lines.append(bonus_line)
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
 
 
 async def _check_weekly_modifier(bot: Bot) -> None:

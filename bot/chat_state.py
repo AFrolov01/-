@@ -31,6 +31,7 @@ def _new_chat_state() -> dict:
         "active_votes": {},
         "next_duel_due_at": None,
         "title": None,  # человекочитаемое название группы (для общемирового топа)
+        "silent_mode": False,  # /tixa — короткие уведомления, без длинных пояснений
     }
 
 
@@ -54,9 +55,14 @@ def total_groups(db: dict) -> int:
 
 
 def total_unique_players(db: dict) -> int:
+    """Уникальные Telegram user_id среди ВСЕХ групп — и тех, кто уже играл
+    (есть профиль в chat["players"]), и тех, кто просто состоит в клане, но
+    ещё ни разу не участвовал в раунде/не пользовался /iam-/shop-/bank."""
     seen = set()
     for chat in db.get("chats", {}).values():
         seen.update(chat.get("players", {}).keys())
+        for clan in chat.get("clans", {}).values():
+            seen.update(clan.get("members", {}).keys())
     return len(seen)
 
 

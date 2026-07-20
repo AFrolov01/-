@@ -91,17 +91,26 @@ def pick_duel_pair(chat: dict) -> Optional[Tuple[dict, dict, dict, dict]]:
     if len(clans) == 2:
         clan_a, clan_b = clans[0], clans[1]
     else:
-        clans_sorted_outsider = sorted(
-            clans, key=lambda c: (c.get("points", 0), c.get("last_played_at", 0))
-        )
-        clan_a = clans_sorted_outsider[0]
+        # ВАЖНО: clan_a всегда выбирается СТРОГО по тому, кто дольше всех не
+        # играл (last_played_at по возрастанию, никогда не сыгравшие — вперёд
+        # очереди). Раньше здесь сортировали в первую очередь по очкам, из-за
+        # чего клан со "средними" очками мог никогда не попадать в пару и
+        # выглядел как будто его игнорируют — теперь это невозможно: как
+        # только клан сыграл, last_played_at сдвигается вперёд и он уходит в
+        # конец очереди, гарантируя честный round-robin для ВСЕХ кланов.
+        clans_sorted_by_wait = sorted(clans, key=lambda c: c.get("last_played_at", 0))
+        clan_a = clans_sorted_by_wait[0]
 
         alternate_leader = chat.get("matchmaking_alternate_leader", False)
         rest = [c for c in clans if c["id"] != clan_a["id"]]
         if alternate_leader:
+            # иногда соперником берём лидера по очкам — чтобы у лидера тоже
+            # не было простоя и он не "прятался" наверху таблицы
             rest_sorted = sorted(rest, key=lambda c: -c.get("points", 0))
         else:
-            rest_sorted = sorted(rest, key=lambda c: (c.get("points", 0), c.get("last_played_at", 0)))
+            # обычно — второго по очереди ожидания (поддерживает честный
+            # round-robin для всех кланов, а не только для clan_a)
+            rest_sorted = sorted(rest, key=lambda c: c.get("last_played_at", 0))
         clan_b = rest_sorted[0]
         chat["matchmaking_alternate_leader"] = not alternate_leader
 
@@ -113,11 +122,21 @@ def pick_duel_pair(chat: dict) -> Optional[Tuple[dict, dict, dict, dict]]:
 
 
 async def announce_duel(bot: Bot, chat_id: int) -> Tuple[bool, str]:
-    """Объявляет дуэль в КОНКРЕТНОЙ группе. Возвращает (успех, причина/описание)."""
+    """Объявляет дуэль в КОНКРЕТНОЙ группе. Возвращает (успех, причина/описание).
+
+    ВАЖНО: одновременно в группе может быть только ОДНА дуэль "в полёте" —
+    либо неотвеченный вызов (pending_invite), либо уже идущая игра
+    (active_duels). Это специально сделано строгим: если разрешить объявлять
+    новый вызов поверх ещё не сыгранной дуэли, старое приглашение виснет
+    открепленным как попало, а итоговое сообщение по СТАРОЙ дуэли потом
+    прилетает уже во время НОВОЙ и выглядит так, будто оно про случайные,
+    "не вызывавшиеся" кланы — что и было главной жалобой на баги бота."""
     async with Storage() as db:
         chat = get_chat(db, chat_id)
         if chat.get("pending_invite"):
             return False, "Предыдущий вызов на дуэль ещё не сыгран (ждём /minduel от вызванных игроков)."
+        if chat.get("active_duels"):
+            return False, "Предыдущая дуэль ещё не доиграна — новая объявится сразу после её завершения."
         pair = pick_duel_pair(chat)
         if not pair:
             return False, (
@@ -143,11 +162,14 @@ async def announce_duel(bot: Bot, chat_id: int) -> Tuple[bool, str]:
         }
         name_a = f'@{member_a["username"]}' if member_a.get("username") else member_a.get("first_name", "Игрок")
         name_b = f'@{member_b["username"]}' if member_b.get("username") else member_b.get("first_name", "Игрок")
-        text = texts.duel_invite_text(name_a, name_b)
+        silent = chat.get("silent_mode", False)
+        text = texts.duel_invite_text_silent(name_a, name_b) if silent else texts.duel_invite_text(name_a, name_b)
 
         skip_notes = chat.pop("pending_skip_notes", [])
-        if skip_notes:
+        if skip_notes and not silent:
             text = "\n".join(skip_notes) + "\n\n" + text
+            chat["pending_skip_notes"] = []
+        else:
             chat["pending_skip_notes"] = []
 
     try:
@@ -163,21 +185,42 @@ async def announce_duel(bot: Bot, chat_id: int) -> Tuple[bool, str]:
         if chat.get("pending_invite"):
             chat["pending_invite"]["message_id"] = sent.message_id
             chat["pending_invite"]["chat_id"] = sent.chat.id
-    try:
-        await bot.pin_chat_message(sent.chat.id, sent.message_id, disable_notification=True)
-    except Exception:
-        pass  # бот может быть не админом — не критично, просто без закрепления
+    if not silent:
+        try:
+            await bot.pin_chat_message(sent.chat.id, sent.message_id, disable_notification=True)
+        except Exception:
+            pass  # бот может быть не админом — не критично, просто без закрепления
 
     return True, f"Дуэль объявлена: «{clan_a['name']}» vs «{clan_b['name']}»."
 
 
-def _next_interval_seconds() -> float:
-    hours = random.uniform(config.DUEL_INTERVAL_MIN_HOURS, config.DUEL_INTERVAL_MAX_HOURS)
+def _active_clan_count(chat: dict) -> int:
+    return len([c for c in chat.get("clans", {}).values() if c.get("members")])
+
+
+def _next_interval_seconds(chat: dict) -> float:
+    """Чем больше кланов в группе — тем чаще происходят дуэли, так, чтобы у
+    КАЖДОГО отдельного клана было примерно одинаковое число дуэлей в сутки
+    (config.DUELS_PER_CLAN_PER_DAY), независимо от общего числа кланов.
+
+    Каждая дуэль занимает сразу 2 клана, поэтому нужное число дуэлей в сутки =
+    clans * DUELS_PER_CLAN_PER_DAY / 2, а интервал между ними — 24ч, делённые
+    на это число."""
+    clans = max(2, _active_clan_count(chat))
+    duels_per_day = max(0.5, clans * config.DUELS_PER_CLAN_PER_DAY / 2)
+    base_hours = 24 / duels_per_day
+    base_hours = min(
+        config.DUEL_INTERVAL_MAX_HOURS_CEILING,
+        max(config.DUEL_INTERVAL_MIN_HOURS_FLOOR, base_hours),
+    )
+    jitter = config.DUEL_INTERVAL_JITTER
+    hours = random.uniform(base_hours * (1 - jitter), base_hours * (1 + jitter))
     return hours * 3600
 
 
 async def scheduler_loop(bot: Bot) -> None:
-    """Фоновая задача: у каждой группы свой независимый таймер (~4ч ±40мин).
+    """Фоновая задача: у каждой группы свой независимый таймер, интервал
+    которого зависит от числа кланов в ней (см. _next_interval_seconds).
     Проверяем все известные группы раз в несколько минут; если для группы
     подошло время — объявляем в ней дуэль и назначаем следующий момент."""
     while True:
@@ -191,17 +234,22 @@ async def scheduler_loop(bot: Bot) -> None:
                         continue
                     due_at = chat.get("next_duel_due_at")
                     if due_at is None:
-                        chat["next_duel_due_at"] = now() + _next_interval_seconds()
+                        chat["next_duel_due_at"] = now() + _next_interval_seconds(chat)
                         continue
                     if now() >= due_at:
                         due_chat_ids.append(chat_id)
 
             for chat_id in due_chat_ids:
-                success, _reason = await announce_duel(bot, chat_id)
+                success, reason = await announce_duel(bot, chat_id)
                 async with Storage() as db:
                     chat = get_chat(db, chat_id)
-                    # даже если не получилось (например, все заняты) — не долбим
-                    # каждую минуту, пробуем снова через обычный интервал
-                    chat["next_duel_due_at"] = now() + _next_interval_seconds()
+                    if not success and reason.startswith("Предыдущая дуэль"):
+                        # предыдущая дуэль ещё идёт — пробуем снова совсем
+                        # скоро (на следующей проверке), а не ждём целый
+                        # обычный интервал, чтобы новая дуэль стартовала
+                        # сразу же, как только освободится очередь
+                        chat["next_duel_due_at"] = now() + config.SCHEDULER_CHECK_INTERVAL_SECONDS
+                    else:
+                        chat["next_duel_due_at"] = now() + _next_interval_seconds(chat)
         except Exception:
             pass
