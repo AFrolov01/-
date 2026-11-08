@@ -38,6 +38,18 @@ _SHOP_DEFAULTS = {
     "noob_dice_rounds": 0, "grapes_rounds": 0,
 }
 
+# Статистика для «настоящей дуэли» (сравнение игроков)
+_STATS_DEFAULTS = {
+    "win_streak": 0,          # текущая серия побед в раундах подряд
+    "max_win_streak": 0,
+    "points_won_total": 0.0,  # сумма выигранных очков (прибыль сверх ставки) за все раунды
+    "duels_played": 0,        # сколько дуэлей игрок реально сыграл
+    "duels_won": 0,           # сколько из них выиграл
+    "duels_invited": 0,       # сколько раз его вызывали на дуэль
+    "duels_attended": 0,      # на сколько из вызовов он пришёл
+    "chat_msgs": 0,           # сообщений в чате с момента последней настоящей дуэли
+}
+
 
 def _ensure_player_fields(player: dict) -> dict:
     shop = player.setdefault("shop", {})
@@ -45,6 +57,8 @@ def _ensure_player_fields(player: dict) -> dict:
         shop.setdefault(key, default)
     bank = player.setdefault("bank", {"balance": 0.0, "deposited_at": None, "total_interest_earned": 0.0})
     bank.setdefault("total_interest_earned", 0.0)
+    for key, default in _STATS_DEFAULTS.items():
+        player.setdefault(key, default)
     return player
 
 
@@ -68,6 +82,7 @@ def get_or_create_player(db: dict, user_id: int, username: str = "", first_name:
             "bank": {"balance": 0.0, "deposited_at": None, "total_interest_earned": 0.0},
         }
         players[uid] = player
+        _ensure_player_fields(player)
     else:
         # обновим отображаемое имя на случай смены ника
         if username:
@@ -95,6 +110,8 @@ def record_round_result(player: dict, won: bool, multiplier: float, currency_gai
 
     if won:
         player["wins"] = player.get("wins", 0) + 1
+        player["win_streak"] = player.get("win_streak", 0) + 1
+        player["max_win_streak"] = max(player.get("max_win_streak", 0), player["win_streak"])
         gain = multiplier if currency_gain is None else currency_gain
         player["currency"] = round(player.get("currency", 0.0) + gain, 2)
         player["best_multiplier"] = max(player.get("best_multiplier", 0.0), multiplier)
@@ -117,8 +134,16 @@ def record_round_result(player: dict, won: bool, multiplier: float, currency_gai
             new_achievements.append("kak_eto")
     else:
         player["losses"] = player.get("losses", 0) + 1
+        player["win_streak"] = 0
 
     return new_achievements
+
+
+def record_duel_result(player: dict, won: bool) -> None:
+    """Игрок реально сыграл дуэль (обычную или настоящую) — для коэффициента побед в дуэлях."""
+    player["duels_played"] = player.get("duels_played", 0) + 1
+    if won:
+        player["duels_won"] = player.get("duels_won", 0) + 1
 
 
 def tick_temporary_items(player: dict, portal_used_this_round: bool) -> list:

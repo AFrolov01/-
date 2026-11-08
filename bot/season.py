@@ -81,6 +81,7 @@ def finalize_season_locked(chat: dict) -> str:
     if not clans:
         chat["pending_invite"] = None
         chat["active_duels"] = {}
+        chat["real_duel"] = None
         return ""
 
     final_text = build_top_text(chat, "🏁 <b>Сезон завершён!</b>", declare_winner=True)
@@ -156,6 +157,7 @@ def finalize_season_locked(chat: dict) -> str:
 
     chat["pending_invite"] = None
     chat["active_duels"] = {}
+    chat["real_duel"] = None
     return final_text
 
 

@@ -32,6 +32,9 @@ def _new_chat_state() -> dict:
         "next_duel_due_at": None,
         "title": None,  # человекочитаемое название группы (для общемирового топа)
         "silent_mode": False,  # /tixa — короткие уведомления, без длинных пояснений
+        "real_duel": None,  # текущая «настоящая дуэль» (bot/handlers/real_duel.py)
+        "next_real_duel_due_at": None,
+        "last_real_duel_at": None,
     }
 
 

@@ -36,14 +36,14 @@ from aiogram import Bot
 
 import config
 from bot.storage import Storage, now
-from bot import texts
+from bot import texts, players
 from bot.chat_state import get_chat, all_chat_ids
 from bot.clan_utils import ensure_clan_fields
 
 
-def _is_member_busy(chat: dict, user_id: int) -> bool:
-    """True, если игрок сейчас участвует в невыгранной дуэли (приглашён, но ещё
-    не сыграл, либо уже играет) — таких нельзя вызывать на новую дуэль."""
+def is_in_regular_duel(chat: dict, user_id: int) -> bool:
+    """True, если игрок прямо сейчас в АКТИВНОЙ обычной дуэли (приглашён, но ещё
+    не сыграл, либо уже играет). Используется и «настоящей дуэлью»."""
     invite = chat.get("pending_invite")
     if invite and user_id in (invite.get("player_a_id"), invite.get("player_b_id")):
         return True
@@ -52,6 +52,21 @@ def _is_member_busy(chat: dict, user_id: int) -> bool:
             side = duel["sides"][side_key]
             if side["player_id"] == user_id and side["stage"] in ("choose_mines", "playing"):
                 return True
+    return False
+
+
+def _is_member_busy(chat: dict, user_id: int) -> bool:
+    """True, если игрока нельзя вызывать на НОВУЮ обычную дуэль: он в активной
+    обычной дуэли, либо вызван на «настоящую» (но только если в его клане 2+
+    человека — одиночка в клане играет и там и там)."""
+    if is_in_regular_duel(chat, user_id):
+        return True
+    real = chat.get("real_duel")
+    if real and user_id in (real.get("player_a_id"), real.get("player_b_id")):
+        clan_id = real["clan_a_id"] if user_id == real.get("player_a_id") else real["clan_b_id"]
+        clan = chat["clans"].get(str(clan_id))
+        if clan and len(clan.get("members", {})) >= 2:
+            return True
     return False
 
 
@@ -149,6 +164,15 @@ async def announce_duel(bot: Bot, chat_id: int) -> Tuple[bool, str]:
         attempts_b = clan_b.get("carried_attempts", 1)
         clan_a["carried_attempts"] = 1
         clan_b["carried_attempts"] = 1
+
+        # статистика вызовов (для «активности в дуэлях») + метка для правила
+        # «12 часов после обычной дуэли» у настоящей дуэли
+        for _member in (member_a, member_b):
+            _member["last_regular_invite_at"] = now()
+            _pl = players.get_or_create_player(
+                chat, int(_member["user_id"]), _member.get("username", ""), _member.get("first_name", "Игрок")
+            )
+            _pl["duels_invited"] = _pl.get("duels_invited", 0) + 1
 
         chat["pending_invite"] = {
             "clan_a_id": clan_a["id"],

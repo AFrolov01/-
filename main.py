@@ -8,12 +8,13 @@ from aiogram.enums import ParseMode
 from aiogram.types import BotCommand
 
 import config
-from bot.handlers import clan_create, clan_join, clan_info, clan_manage, tactics, shop, bank, ads, duel, player_profile
+from bot.handlers import clan_create, clan_join, clan_info, clan_manage, tactics, shop, bank, ads, duel, player_profile, real_duel
 from bot.matchmaking import scheduler_loop
 from bot.handlers.duel import afk_watcher_loop
 from bot.season import season_watcher_loop
 from bot.turns import turn_watcher_loop
 from bot.handlers.ads import ad_watcher_loop
+from bot.handlers.real_duel import real_duel_scheduler_loop, ChatActivityMiddleware
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
@@ -67,6 +68,8 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
+    # считает сообщения в группах для «активности в чате» (настоящая дуэль), никого не блокирует
+    dp.message.outer_middleware(ChatActivityMiddleware())
 
     dp.include_router(clan_create.router)
     dp.include_router(clan_join.router)
@@ -77,6 +80,7 @@ async def main() -> None:
     dp.include_router(bank.router)
     dp.include_router(ads.router)
     dp.include_router(duel.router)
+    dp.include_router(real_duel.router)  # /realduel (скрытая, только владелец) и кнопка «Сравнить»
     dp.include_router(player_profile.router)  # последним: ловит свободные текстовые триггеры
 
     await _set_commands(bot)
@@ -86,6 +90,7 @@ async def main() -> None:
     asyncio.create_task(season_watcher_loop(bot))
     asyncio.create_task(turn_watcher_loop(bot))
     asyncio.create_task(ad_watcher_loop(bot))
+    asyncio.create_task(real_duel_scheduler_loop(bot))
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)

@@ -195,6 +195,7 @@ def _apply_cashout(
     won_al = round(final_amount)
     new_points = round(clan.get("points", 0) - stake + won_al, 2)
     clan["points"] = new_points
+    player["points_won_total"] = round(player.get("points_won_total", 0.0) + max(won_al - stake, 0), 2)
 
     best = clan.get("best_single_multiplier")
     if not best or multiplier > best.get("value", 0):
@@ -249,6 +250,16 @@ def _finalize_duel_result(chat: dict, duel: dict) -> str:
         elif mult_b > mult_a:
             winner_clan, loser_clan = clan_b, clan_a
         # при равенстве — ничья, стрики никого не трогаем
+
+    # коэффициент побед игроков в дуэлях (для «настоящей дуэли»)
+    for _side, _clan in ((side_a, clan_a), (side_b, clan_b)):
+        if _side.get("result") is None:
+            continue  # не играл — в сыгранные не считаем
+        _member = _clan.get("members", {}).get(str(_side["player_id"]), {})
+        _pl = players.get_or_create_player(
+            chat, _side["player_id"], _member.get("username", ""), _member.get("first_name", "Игрок")
+        )
+        players.record_duel_result(_pl, won=(winner_clan is not None and _clan["id"] == winner_clan["id"]))
 
     if winner_clan is not None:
         winner_clan["current_win_streak"] = winner_clan.get("current_win_streak", 0) + 1
@@ -474,6 +485,10 @@ async def cb_choose_mines(callback: CallbackQuery) -> None:
         clan = _find_clan(chat, side["clan_id"])
         user = callback.from_user
         player = players.get_or_create_player(chat, user.id, user.username or "", user.first_name or "Игрок")
+
+        if not side.get("attended"):
+            side["attended"] = True
+            player["duels_attended"] = player.get("duels_attended", 0) + 1
 
         portals_count = players.portals_count_for(clan, player)
         mine_positions, portal_positions = game.generate_field(mines, portals_count)
