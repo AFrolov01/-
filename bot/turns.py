@@ -20,11 +20,14 @@
 import asyncio
 
 from aiogram import Bot
+from aiogram.types import InlineKeyboardMarkup
 
 import config
 from bot.storage import Storage, now
 from bot.chat_state import get_chat, all_chat_ids
 from bot.clan_utils import ensure_clan_fields
+from bot import betting
+from bot.invite_view import invite_view
 
 
 def _skip_note_for(clan: dict, player_id: int) -> str:
@@ -35,6 +38,7 @@ def _skip_note_for(clan: dict, player_id: int) -> str:
 
 async def _expire_pending_invites(bot: Bot) -> None:
     to_unpin = []  # (chat_id, message_id)
+    to_edit = []   # (chat_id, message_id, text) — анонс без кнопок ставок
 
     async with Storage() as db:
         for chat_id in all_chat_ids(db):
@@ -55,8 +59,27 @@ async def _expire_pending_invites(bot: Bot) -> None:
 
             if invite.get("chat_id") and invite.get("message_id"):
                 to_unpin.append((invite["chat_id"], invite["message_id"]))
+
+            # вызов не принят — ставки зрителей возвращаются полностью (и купоны тоже)
+            if invite.get("bets") is not None:
+                betting.refund(chat, invite["bets"])
+                if invite.get("chat_id") and invite.get("message_id"):
+                    view = invite_view(chat, invite, closed=True)
+                    if view:
+                        to_edit.append((
+                            invite["chat_id"], invite["message_id"],
+                            view[0] + "\n\n⌛ Вызов не принят вовремя — ставки (если были) возвращены.",
+                        ))
             chat["pending_invite"] = None
 
+    for chat_id, message_id, text in to_edit:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=text, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[]),  # убираем кнопки ставок
+            )
+        except Exception:
+            pass
     for chat_id, message_id in to_unpin:
         try:
             await bot.unpin_chat_message(chat_id, message_id)
@@ -65,7 +88,7 @@ async def _expire_pending_invites(bot: Bot) -> None:
 
 
 async def _expire_stuck_duel_sides(bot: Bot) -> None:
-    notifications = []  # (chat_id, text)
+    notifications = []  # (chat_id, text, reply_to_message_id)
     to_unpin = []
 
     async with Storage() as db:
@@ -98,16 +121,15 @@ async def _expire_stuck_duel_sides(bot: Bot) -> None:
                     from bot.handlers.duel import _finalize_duel_result
                     text = _finalize_duel_result(chat, duel)
                     if text:
-                        notifications.append((chat_id, text))
+                        notifications.append((chat_id, text, duel.get("start_message_id")))
                     if duel.get("pinned_chat_id") and duel.get("pinned_message_id"):
                         to_unpin.append((duel["pinned_chat_id"], duel["pinned_message_id"]))
                     del chat["active_duels"][duel_id]
 
-    for chat_id, text in notifications:
-        try:
-            await bot.send_message(chat_id, text, parse_mode="HTML")
-        except Exception:
-            pass
+    if notifications:
+        from bot.handlers.duel import _send_finale
+        for chat_id, text, reply_to in notifications:
+            await _send_finale(bot, chat_id, text, reply_to)
     for chat_id, message_id in to_unpin:
         try:
             await bot.unpin_chat_message(chat_id, message_id)

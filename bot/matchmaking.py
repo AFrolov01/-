@@ -36,7 +36,8 @@ from aiogram import Bot
 
 import config
 from bot.storage import Storage, now
-from bot import texts, players
+from bot import texts, players, betting
+from bot.invite_view import invite_view
 from bot.chat_state import get_chat, all_chat_ids
 from bot.clan_utils import ensure_clan_fields
 
@@ -174,7 +175,14 @@ async def announce_duel(bot: Bot, chat_id: int) -> Tuple[bool, str]:
             )
             _pl["duels_invited"] = _pl.get("duels_invited", 0) + 1
 
-        chat["pending_invite"] = {
+        name_a = f'@{member_a["username"]}' if member_a.get("username") else member_a.get("first_name", "Игрок")
+        name_b = f'@{member_b["username"]}' if member_b.get("username") else member_b.get("first_name", "Игрок")
+        silent = chat.get("silent_mode", False)
+
+        skip_notes = chat.pop("pending_skip_notes", [])
+        chat["pending_skip_notes"] = []
+
+        invite = {
             "clan_a_id": clan_a["id"],
             "player_a_id": member_a["user_id"],
             "clan_b_id": clan_b["id"],
@@ -183,21 +191,30 @@ async def announce_duel(bot: Bot, chat_id: int) -> Tuple[bool, str]:
             "attempts_b": attempts_b,
             "created_at": now(),
             "message_id": None,
+            "name_a": name_a,
+            "name_b": name_b,
+            # заметки о пропущенных ходах — часть текста анонса (чтобы не пропадали при его обновлении)
+            "prefix": "\n".join(skip_notes) if (skip_notes and not silent) else "",
+            "bets": None,
         }
-        name_a = f'@{member_a["username"]}' if member_a.get("username") else member_a.get("first_name", "Игрок")
-        name_b = f'@{member_b["username"]}' if member_b.get("username") else member_b.get("first_name", "Игрок")
-        silent = chat.get("silent_mode", False)
-        text = texts.duel_invite_text_silent(name_a, name_b) if silent else texts.duel_invite_text(name_a, name_b)
+        # тотализатор: в тихом режиме (/tixa) группу ничем не нагружаем — ставок нет.
+        # Иксы считаются здесь, один раз, и дальше не меняются.
+        if not silent:
+            invite["bets"] = betting.new_bets(chat, invite)
+        chat["pending_invite"] = invite
 
-        skip_notes = chat.pop("pending_skip_notes", [])
-        if skip_notes and not silent:
-            text = "\n".join(skip_notes) + "\n\n" + text
-            chat["pending_skip_notes"] = []
+        markup = None
+        if silent:
+            text = texts.duel_invite_text_silent(name_a, name_b)
         else:
-            chat["pending_skip_notes"] = []
+            view = invite_view(chat, invite)
+            if view:
+                text, markup = view
+            else:  # на всякий случай: кланы не найдены — старый короткий текст
+                text = texts.duel_invite_text(name_a, name_b)
 
     try:
-        sent = await bot.send_message(chat_id, text, parse_mode="HTML")
+        sent = await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
     except Exception as e:
         async with Storage() as db:
             chat = get_chat(db, chat_id)

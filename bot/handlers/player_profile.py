@@ -47,6 +47,14 @@ def _build_profile_text(chat: dict, user_id: int) -> str:
     avg_30d = players.average_multiplier_30d(player)
     wr = players.win_rate(player)
 
+    # строка про ставки на дуэли — только если человек хоть раз ставил
+    bets_won, bets_lost = player.get("bets_won", 0), player.get("bets_lost", 0)
+    bets_line = ""
+    if bets_won + bets_lost > 0:
+        profit = player.get("bet_profit_total", 0)
+        sign = "+" if profit > 0 else ""
+        bets_line = f"🎰 Ставки на дуэли: угадано {bets_won} из {bets_won + bets_lost}, итог {sign}{profit:.2f} Те\n"
+
     return (
         f"👤 <b>Профиль: {name}</b>\n"
         f"🏰 Клан: {clan_line}\n\n"
@@ -54,7 +62,8 @@ def _build_profile_text(chat: dict, user_id: int) -> str:
         f"🎯 Шанс победы: {wr}% ({player.get('wins', 0)}/{player.get('total_rounds', 0)})\n"
         f"📊 Средний множитель (всё время): x{avg_all:.2f}\n"
         f"📅 Средний множитель (30 дней): x{avg_30d:.2f}\n"
-        f"💰 Баланс: {player.get('currency', 0):.2f} Те\n\n"
+        f"💰 Баланс: {player.get('currency', 0):.2f} Те\n"
+        f"{bets_line}\n"
         f"🏅 Достижения: {players.achievements_text(player)}"
     )
 

@@ -35,7 +35,7 @@ from bot.leaderboard import build_top_text
 from bot.clan_utils import ensure_clan_fields
 from bot.leveling import level_from_xp, apply_level_up_reputation
 from bot.reputation import add_reputation
-from bot import players
+from bot import players, betting
 
 
 # ------------------------------------------------------- завершение сезона -
@@ -79,6 +79,7 @@ def finalize_season_locked(chat: dict) -> str:
         ensure_clan_fields(clan)
 
     if not clans:
+        betting.refund_chat_bets(chat)
         chat["pending_invite"] = None
         chat["active_duels"] = {}
         chat["real_duel"] = None
@@ -155,6 +156,7 @@ def finalize_season_locked(chat: dict) -> str:
         "новый сезон командой /tactic — сменить её потом до конца сезона будет нельзя."
     )
 
+    betting.refund_chat_bets(chat)  # незавершённые дуэли отменяются — ставки зрителей возвращаем
     chat["pending_invite"] = None
     chat["active_duels"] = {}
     chat["real_duel"] = None

@@ -9,6 +9,7 @@ from aiogram.types import BotCommand
 
 import config
 from bot.handlers import clan_create, clan_join, clan_info, clan_manage, tactics, shop, bank, ads, duel, player_profile, real_duel
+from bot.handlers import betting as bets_handlers
 from bot.matchmaking import scheduler_loop
 from bot.handlers.duel import afk_watcher_loop
 from bot.season import season_watcher_loop
@@ -21,8 +22,8 @@ logger = logging.getLogger("main")
 
 
 async def _set_commands(bot: Bot) -> None:
-    # ВАЖНО: /creatadd сюда НЕ добавляется — это секретная команда владельца,
-    # она не должна светиться в меню команд ни у кого.
+    # ВАЖНО: /creatadd, /realduel и /online сюда НЕ добавляются — это секретные команды
+    # владельца, они не должны светиться в меню команд ни у кого.
     await bot.set_my_commands([
         BotCommand(command="start", description="Как пользоваться ботом"),
         BotCommand(command="help", description="Подробный гайд по всем механикам"),
@@ -36,8 +37,8 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="top", description="Топ кланов этой группы"),
         BotCommand(command="globaltop", description="Топ кланов среди всех групп"),
         BotCommand(command="season", description="Сколько дней осталось до конца сезона"),
-        BotCommand(command="online", description="Сколько групп и игроков используют бота"),
         BotCommand(command="minduel", description="Начать назначенную дуэль"),
+        BotCommand(command="bets", description="Тотализатор: как ставить на дуэли"),
         BotCommand(command="tixa", description="Тихий режим дуэлей (только владелец группы)"),
     ])
 
@@ -80,6 +81,7 @@ async def main() -> None:
     dp.include_router(bank.router)
     dp.include_router(ads.router)
     dp.include_router(duel.router)
+    dp.include_router(bets_handlers.router)  # тотализатор: ставки зрителей на дуэли
     dp.include_router(real_duel.router)  # /realduel (скрытая, только владелец) и кнопка «Сравнить»
     dp.include_router(player_profile.router)  # последним: ловит свободные текстовые триггеры
 

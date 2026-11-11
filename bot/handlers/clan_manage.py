@@ -25,6 +25,7 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import config
+from bot import betting
 from bot.storage import Storage, now
 from bot.chat_state import get_chat, resolve_chat_for_message, all_chat_ids
 from bot.keyboards import confirm_kb
@@ -292,10 +293,12 @@ async def cb_delete_clan_confirm(callback: CallbackQuery) -> None:
         # подчищаем связанные состояния, чтобы не остались "битые" ссылки
         invite = chat.get("pending_invite")
         if invite and (invite["clan_a_id"] == clan_id or invite["clan_b_id"] == clan_id):
+            betting.refund(chat, invite.get("bets"))  # ставки зрителей возвращаем
             chat["pending_invite"] = None
         for duel_id in list(chat["active_duels"].keys()):
             duel = chat["active_duels"][duel_id]
             if duel["sides"]["a"]["clan_id"] == clan_id or duel["sides"]["b"]["clan_id"] == clan_id:
+                betting.refund(chat, duel.get("bets"))
                 del chat["active_duels"][duel_id]
 
     await callback.message.edit_text(f"🗑 Клан «{clan_name}» расформирован.")
