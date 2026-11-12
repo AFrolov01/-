@@ -35,6 +35,7 @@ def _new_chat_state() -> dict:
         "real_duel": None,  # текущая «настоящая дуэль» (bot/handlers/real_duel.py)
         "next_real_duel_due_at": None,
         "last_real_duel_at": None,
+        "bot_pins": [],  # id сообщений, которые бот закрепил (bot/pins.py) — чтобы гарантированно открепить
     }
 
 

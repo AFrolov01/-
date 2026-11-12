@@ -3,19 +3,20 @@
 НАСТОЯЩАЯ ДУЭЛЬ — сравнение статистики двух игроков.
 
 Как это работает
- - Раз в config.REAL_DUEL_INTERVAL_HOURS (48 ч) в каждой группе объявляется
-   настоящая дуэль: два клана, по одному игроку от каждого.
+ - РОВНО раз в config.REAL_DUEL_INTERVAL_HOURS (48 ч = 2 дня) в каждой группе
+   объявляется настоящая дуэль: два клана, по одному игроку от каждого.
+   Расписание — жёсткая сетка (следующий срок = прошлый срок + 48 ч), без
+   накопления задержек. Если срок уже прошёл (бот лежал/деплой) — дуэль
+   объявляется сразу, а следующий срок берётся с сетки в будущем.
  - Настоящая дуэль НЕ отменяет и не заменяет обычную (мины): они идут параллельно,
    у каждой свой слот (chat["real_duel"] против chat["pending_invite"] /
    chat["active_duels"]).
- - Кого звать от клана:
+ - Кого звать от клана (никакого ожидания «окна после обычной дуэли» нет —
+   обычные дуэли идут часто, и из-за такого правила настоящая не объявлялась):
      * в клане 1 человек -> он играет и там и там;
-     * в клане 2+ человека -> тот, у кого НЕТ активной обычной дуэли, и (правило
-       «чтобы не было каши») с последнего его вызова на обычную дуэль прошло
-       не меньше config.REAL_DUEL_GAP_AFTER_REGULAR_HOURS (12 ч). Если настоящая
-       дуэль просрочена на config.REAL_DUEL_RELAX_AFTER_HOURS и всё ещё некого
-       звать — правило 12 часов ослабляется (остаётся «нет активной обычной
-       дуэли»), иначе дуэль могла бы не состояться никогда.
+     * в клане 2+ человека -> в первую очередь тот, у кого НЕТ активной обычной
+       дуэли (а из них — кто дольше всех не играл настоящую); если таких нет —
+       любой участник клана.
  - Достаточно, чтобы ОДИН из двух нажал «⚔️ Сравнить» — сразу показывается
    таблица из 7 критериев, подсчёт очков и перевод очков между кланами.
  - Если никто не нажал за config.REAL_DUEL_TIMEOUT_HOURS — дуэль отменяется
@@ -126,26 +127,36 @@ def _transfer_percent(diff: int) -> int:
     return 0
 
 
-def _pick_real_player(chat: dict, clan: dict, relax: bool) -> Optional[dict]:
+def _pick_real_player(chat: dict, clan: dict) -> Optional[dict]:
+    """Игрок клана для настоящей дуэли. Выбор НИКОГДА не «не находит» игрока, если в
+    клане кто-то есть: настоящая дуэль идёт строго по расписанию."""
     members = list(clan.get("members", {}).values())
     if not members:
         return None
     if len(members) == 1:
         return members[0]  # одиночка играет и в обычной, и в настоящей
 
+    # предпочитаем тех, у кого сейчас нет активной обычной дуэли; если вдруг заняты
+    # все — берём любого (настоящая дуэль обычной не мешает)
     free = [m for m in members if not is_in_regular_duel(chat, int(m["user_id"]))]
-    if not relax:
-        cutoff = now() - config.REAL_DUEL_GAP_AFTER_REGULAR_HOURS * 3600
-        free = [m for m in free if m.get("last_regular_invite_at", 0) <= cutoff]
-    if not free:
-        return None
-    free.sort(key=lambda m: m.get("last_real_duel_at", 0))
-    return free[0]
+    pool = free or members
+    pool.sort(key=lambda m: (m.get("last_real_duel_at", 0), m.get("last_regular_invite_at", 0)))
+    return pool[0]
+
+
+def _next_slot(due_at: float, current: float) -> float:
+    """Следующий срок на жёсткой сетке «срок + 48 ч, +96 ч, …» строго в будущем.
+    Дрейфа нет: сдвиг считается от ПРОШЛОГО срока, а не от момента объявления."""
+    step = config.REAL_DUEL_INTERVAL_HOURS * 3600
+    if due_at > current:
+        return due_at
+    missed = int((current - due_at) // step) + 1
+    return due_at + missed * step
 
 
 # ================================================================ announce ==
 
-async def announce_real_duel(bot: Bot, chat_id: int, relax: bool = False) -> Tuple[bool, str]:
+async def announce_real_duel(bot: Bot, chat_id: int) -> Tuple[bool, str]:
     async with Storage() as db:
         chat = get_chat(db, chat_id)
         if chat.get("real_duel"):
@@ -161,10 +172,10 @@ async def announce_real_duel(bot: Bot, chat_id: int, relax: bool = False) -> Tup
         clans.sort(key=lambda c: (c.get("last_real_duel_at", 0), c.get("points", 0)))
         clan_a, clan_b = clans[0], clans[1]
 
-        member_a = _pick_real_player(chat, clan_a, relax)
-        member_b = _pick_real_player(chat, clan_b, relax)
+        member_a = _pick_real_player(chat, clan_a)
+        member_b = _pick_real_player(chat, clan_b)
         if not member_a or not member_b:
-            return False, "Пока некого звать: у игроков кланов недавно или прямо сейчас идёт обычная дуэль."
+            return False, "Для настоящей дуэли нужно минимум 2 клана с участниками."
 
         rd = {
             "id": int(now()),
@@ -381,18 +392,15 @@ async def cb_compare(callback: CallbackQuery, bot: Bot) -> None:
 @router.message(Command("realduel"))
 async def cmd_realduel(message: Message, bot: Bot) -> None:
     """Секретная команда владельца бота: объявить настоящую дуэль в этой группе
-    прямо сейчас (для проверки). Не в меню команд; остальным — молчание."""
+    прямо сейчас (для проверки). Не в меню команд; остальным — молчание.
+    Расписание (сетка раз в 48 ч) она НЕ сдвигает: это только проверка."""
     if message.from_user.id != config.ADMIN_ID:
         return
     if message.chat.type not in ("group", "supergroup"):
         await message.reply("Команду нужно вызвать в группе.")
         return
-    ok, reason = await announce_real_duel(bot, message.chat.id, relax=True)
-    if ok:
-        async with Storage() as db:
-            chat = get_chat(db, message.chat.id)
-            chat["next_real_duel_due_at"] = now() + config.REAL_DUEL_INTERVAL_HOURS * 3600
-    else:
+    ok, reason = await announce_real_duel(bot, message.chat.id)
+    if not ok:
         await message.reply(reason)
 
 
@@ -428,7 +436,7 @@ async def _expire_real_duels(bot: Bot) -> None:
 
 
 async def _check_schedule(bot: Bot) -> None:
-    due = []  # (chat_id, relax)
+    due = []  # (chat_id, срок)
     async with Storage() as db:
         for chat_id in all_chat_ids(db):
             chat = get_chat(db, chat_id)
@@ -437,20 +445,21 @@ async def _check_schedule(bot: Bot) -> None:
                 continue
             due_at = chat.get("next_real_duel_due_at")
             if due_at is None:
+                # группа видит расписание впервые — первая настоящая дуэль через 48 ч
                 chat["next_real_duel_due_at"] = now() + config.REAL_DUEL_INTERVAL_HOURS * 3600
                 continue
             if now() >= due_at:
-                relax = now() - due_at >= config.REAL_DUEL_RELAX_AFTER_HOURS * 3600
-                due.append((chat_id, relax))
+                due.append((chat_id, due_at))
 
-    for chat_id, relax in due:
-        ok, reason = await announce_real_duel(bot, chat_id, relax=relax)
+    for chat_id, due_at in due:
+        ok, reason = await announce_real_duel(bot, chat_id)
         if ok:
             async with Storage() as db:
                 chat = get_chat(db, chat_id)
-                chat["next_real_duel_due_at"] = now() + config.REAL_DUEL_INTERVAL_HOURS * 3600
+                # сдвигаем по сетке от ПРОШЛОГО срока: ровно каждые 48 часов, без дрейфа
+                chat["next_real_duel_due_at"] = _next_slot(due_at, now())
         else:
-            logger.info("Настоящая дуэль в %s пока не объявлена: %s", chat_id, reason)
+            logger.warning("Настоящая дуэль в %s не объявлена (повтор через пару минут): %s", chat_id, reason)
 
 
 async def real_duel_scheduler_loop(bot: Bot) -> None:

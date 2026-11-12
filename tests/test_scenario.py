@@ -170,9 +170,11 @@ async def scenario1():
 
     # --- старт: ставки закрываются
     ok, msg = await duel._start_duel_core(bot, CHAT, 100); assert ok, msg
-    closed = [l for l in bot.log if l[0] == "edit" and l[1] == inv_msg.message_id][-1]
-    print("=== АНОНС ЗАКРЫТ ===\n" + closed[2])
-    assert "Ставки закрыты" in closed[2] and closed[3]["reply_markup"].inline_keyboard == []
+    # вызов УДАЛЯЕТСЯ (чат не засоряется), а сразу после этого приходит сообщение с правилами и выбором мин
+    assert ("delete", inv_msg.message_id) in bot.log, "сообщение-вызов должно быть удалено"
+    assert bot.log.index(("delete", inv_msg.message_id)) < max(i for i, l in enumerate(bot.log) if l[0] == "send")
+    assert not [l for l in bot.log if l[0] == "edit" and l[1] == inv_msg.message_id and "Ставки закрыты" in l[2]]
+    print("=== ВЫЗОВ УДАЛЁН, СЛЕДОМ ПРАВИЛА ===")
     r, _ = await env.tap("dina", "bet:a:ask"); assert r[1] and "закрыты" in r[0]
     rules = bot.sent()[-1]; start_msg = bot.msgs[max(bot.msgs)]
     assert len(rules[2]) < 450

@@ -29,6 +29,7 @@
 """
 
 import asyncio
+import logging
 import random
 from typing import Optional, Tuple
 
@@ -36,10 +37,12 @@ from aiogram import Bot
 
 import config
 from bot.storage import Storage, now
-from bot import texts, players, betting
+from bot import texts, players, betting, pins
 from bot.invite_view import invite_view
 from bot.chat_state import get_chat, all_chat_ids
 from bot.clan_utils import ensure_clan_fields
+
+logger = logging.getLogger("matchmaking")
 
 
 def is_in_regular_duel(chat: dict, user_id: int) -> bool:
@@ -227,10 +230,15 @@ async def announce_duel(bot: Bot, chat_id: int) -> Tuple[bool, str]:
             chat["pending_invite"]["message_id"] = sent.message_id
             chat["pending_invite"]["chat_id"] = sent.chat.id
     if not silent:
+        # новая дуэль началась — сначала снимаем всё, что осталось закреплённым от старых
+        # (в том числе «висяки» старых версий бота), и только потом закрепляем новый вызов
         try:
-            await bot.pin_chat_message(sent.chat.id, sent.message_id, disable_notification=True)
+            await pins.sweep(bot, chat_id, legacy=True)
         except Exception:
-            pass  # бот может быть не админом — не критично, просто без закрепления
+            logger.exception("Ошибка зачистки закрепов перед новым вызовом")
+        if await pins.try_pin(bot, sent.chat.id, sent.message_id):  # бот может быть не админом — не критично
+            async with Storage() as db:
+                pins.register(get_chat(db, chat_id), sent.message_id)
 
     return True, f"Дуэль объявлена: «{clan_a['name']}» vs «{clan_b['name']}»."
 
@@ -293,4 +301,4 @@ async def scheduler_loop(bot: Bot) -> None:
                     else:
                         chat["next_duel_due_at"] = now() + _next_interval_seconds(chat)
         except Exception:
-            pass
+            logger.exception("Ошибка планировщика дуэлей")

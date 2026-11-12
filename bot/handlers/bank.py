@@ -2,298 +2,402 @@
 """
 Банк для валюты Те (своя экономика в каждой группе).
 
-ВВОД СУММЫ (исправлено): после /bank бот просит сумму и показывает поле ответа
-(ForceReply) — ответ на сообщение бота доходит до него даже в группе с включённым
-режимом приватности. Сумма понимается в любом разумном виде: «50», «50,5», «1 000»,
-«50 Те», «положить 50», «снять 50», «всё». Раньше подсказка просила писать
-«положить СУММА», а режим ожидания принимал только голое число — из-за этого ввод
-отменялся, а следующее число никто не слушал. Теперь при непонятной сумме бот
-переспрашивает (до 3 раз), а не отменяет сразу.
+ОДНО СООБЩЕНИЕ-ПАНЕЛЬ. /bank присылает ОДНО сообщение с информацией о банке и двумя
+кнопками «➕ Положить» / «➖ Снять». Дальше чат не засоряется: любое нажатие кнопки и
+любой ввод суммы ИЗМЕНЯЮТ это же сообщение, а не пишут новое.
 
- - /bank (без аргументов) — правила + текущий баланс, и сразу спрашивает,
-   сколько внести (следующим сообщением). Если в ответ пришло не число —
-   запрос отменяется, повторно сумма не считывается.
- - /bank положить СУММА (или "всё"/"все") — внести сразу, без лишнего шага.
- - /bank снять СУММА (или "всё"/"все") — снять сразу. Отдельной команды
-   /bank_snyat больше нет — снятие идёт через /bank или через фразу "Банк".
- - Снять деньги можно в ЛЮБОЙ момент, без ожидания (задержки на вывод нет).
- - Бот также понимает обычные фразы без слэша (в группе и в ЛС):
-   "Банк", "Банк положить 50", "Банк положить всё",
-   "Банк снять 50", "Банк снять всё".
- - Везде только русский текст (внести / снять / остаток), без deposit/withdraw.
- - В конце любого сообщения банка всегда есть подсказка, как положить/снять
-   (в том числе словом "всё"/"все"), чтобы не нужно было помнить синтаксис.
+ - В панели всегда видно: сколько Те на руках, сколько на вкладе (уже С УЧЁТОМ
+   накапавших процентов), сколько накапало и сколько начислено за всё время.
+ - Нажали «➕ Положить» / «➖ Снять» — то же сообщение просит сумму и показывает кнопки
+   «Всё» и «Половина» (с суммами), а также «↩️ Назад».
+ - Сумму можно написать в чат: число («50», «50,5», «1 000», «50 Те»), «всё», «половина».
+   Работает и «по привычке» — с глаголом: «положить 50», «снять всё», «положить половину»
+   (глагол главнее выбранной кнопки). Ответ на сообщение с панелью тоже работает — это
+   важно, если у бота включён режим приватности: тогда обычные сообщения в группе он не
+   видит, а ответы на свои — видит всегда.
+ - Результат операции показывается в той же панели, и кнопки возвращаются.
+ - Панель принадлежит тому, кто вызвал /bank: чужие нажатия отклоняются.
+
+Команды без панели-диалога по-прежнему работают (панель приходит уже с результатом):
+ - /bank положить СУММА | всё | половина   (то же: «Банк положить 50»)
+ - /bank снять СУММА | всё | половина      (то же: «Банк снять всё»)
+ - «Банк 50» / «/bank 50» — голая сумма без глагола считается внесением.
+ - Снять деньги можно в ЛЮБОЙ момент, без ожидания.
+
+Кнопки не хранят состояние в памяти бота: в callback_data зашиты группа и владелец, поэтому
+панели продолжают работать и после перезапуска. В памяти живёт только «ждём сумму от этого
+человека» (после перезапуска достаточно снова нажать кнопку).
 """
 
+import html
 import math
 import re
-from typing import Tuple
+import time
+from typing import Dict, Optional, Tuple
 
-from aiogram import Router, F
-from aiogram.filters import Command, StateFilter
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, ForceReply
+from aiogram import Bot, F, Router
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import config
-from bot.storage import Storage, now
-from bot.chat_state import get_chat, resolve_chat_for_message
 from bot import players
-from bot.fsm_utils import check_command_escape
+from bot.chat_state import get_chat, resolve_chat_for_message
+from bot.storage import Storage, now
 
 router = Router(name="bank")
 
-RULES_TEXT = (
-    "🏦 <b>Банк</b>\n\n"
-    f"💹 Ставка: {config.BANK_DAILY_RATE * 100:g}% в день (сложный процент — "
-    "проценты сами капают на проценты).\n"
-    "✅ Снять деньги можно в любой момент, без ожидания."
-)
-
-HINT_TEXT = (
-    "\n\n💬 Положить: «/bank положить 50» или «/bank», затем ответьте суммой. "
-    "Снять: «/bank снять 50». Вместо суммы можно написать «всё»."
-)
-
-PROMPT_DEPOSIT = (
-    "\n\n💬 <b>Сколько Те внести?</b> Ответьте на это сообщение суммой — например "
-    "<code>50</code> — или словом «всё». Чтобы снять со вклада, напишите «снять 50»."
-)
-PROMPT_WITHDRAW = (
-    "\n\n💬 <b>Сколько Те снять?</b> Ответьте на это сообщение суммой — например "
-    "<code>50</code> — или словом «всё»."
-)
-MAX_TRIES = 3  # сколько раз бот переспрашивает сумму, прежде чем отменить ввод
-
 _ALL_WORDS = ("всё", "все", "всю", "all")
+_HALF_WORDS = ("половина", "половину", "половины", "пополам", "half")
 _DEPOSIT_VERBS = ("положить", "внести", "пополнить")
 _WITHDRAW_VERBS = ("снять", "вывести")
 
+_WAIT_TTL = 900  # сколько секунд после последнего действия бот «слушает» сумму от человека
 
-class BankStates(StatesGroup):
-    waiting_deposit_amount = State()
-    waiting_withdraw_amount = State()
+# (id_чата_с_панелью, id_человека) -> {"mid": id_сообщения_панели, "game_chat_id": id_группы,
+#                                       "mode": "dep" | "wd" | None, "ts": время}
+# Живёт в памяти: после перезапуска бота достаточно нажать кнопку на панели ещё раз.
+_WAIT: Dict[Tuple[int, int], dict] = {}
 
 
-def _info_text(player: dict) -> str:
-    balance = players.bank_current_balance(player)
-    total_interest = players.bank_total_interest_earned(player)
-    text = (
-        RULES_TEXT
-        + f"\n\n💰 На руках: {player.get('currency', 0):.2f} Те\n"
-        + f"🏦 На вкладе (с процентами): {balance:.2f} Те"
-    )
-    if total_interest > 0:
-        text += f"\n💹 Всего начислено процентами за всё время: {total_interest:.2f} Те"
-    return text
-
+# ----------------------------------------------------------------- разбор ---
 
 def _split_verb(raw: str) -> Tuple[str, str]:
     """«положить 50» -> ("положить", "50"); без глагола -> ("", raw)."""
-    parts = raw.strip().split(maxsplit=1)
+    parts = (raw or "").strip().split(maxsplit=1)
     if parts and parts[0].lower() in _DEPOSIT_VERBS + _WITHDRAW_VERBS:
-        return parts[0].lower(), (parts[1] if len(parts) > 1 else "")
-    return "", raw.strip()
+        return parts[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
+    return "", (raw or "").strip()
 
 
-def _parse_amount(raw: str, player: dict, for_withdraw: bool) -> Tuple[float, str]:
-    """Возвращает (сумма, ошибка). Если ошибка не пустая — сумма не валидна.
-    Понимает: «50», «50,5», «1 000», «50 Те», «всё»."""
-    raw = (raw or "").replace("\u00a0", " ").strip().lower()
+def _parse_token(raw: str) -> Optional[Tuple[str, float]]:
+    """Разбирает сумму: ("all", 0) | ("half", 0) | ("num", число). None — это не сумма.
+    Понимает «50», «50,5», «1 000», «50 Те», «всё», «половина»."""
+    raw = (raw or "").replace(" ", " ").strip().lower()
+    if not raw:
+        return None
     if raw in _ALL_WORDS:
-        amount = players.bank_current_balance(player) if for_withdraw else player.get("currency", 0.0)
-        if amount <= 0:
-            return 0.0, "Сумма для операции получилась нулевой."
-        return amount, ""
-    cleaned = re.sub(r"\s*(?:те|te)\.?$", "", raw)            # «50 Те» -> «50»
+        return "all", 0.0
+    if raw in _HALF_WORDS:
+        return "half", 0.0
+    cleaned = re.sub(r"\s*(?:те|te)\.?$", "", raw)                  # «50 Те» -> «50»
     cleaned = re.sub(r"(?<=\d)[ _](?=\d{3}(?:\D|$))", "", cleaned)  # «1 000» -> «1000»
     cleaned = cleaned.replace(",", ".")
     try:
         amount = float(cleaned)
     except ValueError:
-        return 0.0, "не_число"
+        return None
     if not math.isfinite(amount):
-        return 0.0, "не_число"
-    amount = round(amount, 2)
+        return None
+    return "num", round(amount, 2)
+
+
+def _resolve_amount(token: Tuple[str, float], available: float, deposit: bool) -> Tuple[float, str]:
+    """(сумма, ошибка). «Всё» и «половина» считаются от доступного: Те на руках (внести)
+    или текущий вклад с процентами (снять)."""
+    kind, value = token
+    if kind in ("all", "half") and available <= 0:
+        return 0.0, "На руках нет Те — вносить нечего." if deposit else "На вкладе пусто — снимать нечего."
+    if kind == "all":
+        amount = round(available, 2)
+    elif kind == "half":
+        amount = round(available / 2, 2)
+        if amount <= 0:
+            return 0.0, "Половина получилась нулевой — попробуйте «всё»."
+    else:
+        amount = value
     if amount <= 0:
         return 0.0, "Сумма должна быть положительной."
     return amount, ""
 
 
-async def _do_deposit(message: Message, player: dict, amount: float) -> bool:
-    """True — вклад внесён; False — отказ (сообщение пользователю уже отправлено)."""
-    if player.get("currency", 0.0) + 0.005 < amount:
-        await message.reply(f"Недостаточно Те на руках (есть {player.get('currency', 0):.2f})." + HINT_TEXT)
-        return False
-    amount = min(amount, player.get("currency", 0.0))  # гасим расхождение в пол-копейки из-за округления
-    players.bank_settle(player)  # фиксируем накопленные проценты в общий счётчик, не теряем их
+# --------------------------------------------------------------- операции ---
+
+def _apply_deposit(player: dict, amount: float) -> Tuple[bool, str]:
+    cash = player.get("currency", 0.0)
+    if cash + 0.005 < amount:
+        return False, f"Недостаточно Те на руках (есть {cash:.2f})."
+    amount = min(amount, cash)  # гасим расхождение в пол-копейки из-за округления
+    players.bank_settle(player)  # фиксируем накопленные проценты, не теряем их
     bank = player["bank"]
-    player["currency"] = round(player["currency"] - amount, 2)
+    player["currency"] = round(cash - amount, 2)
     bank["balance"] = round(bank["balance"] + amount, 2)
     bank["deposited_at"] = now()
-    await message.reply(
-        f"✅ Внесено {amount:.2f} Те. Остаток на вкладе: {bank['balance']:.2f} Те." + HINT_TEXT
-    )
-    return True
+    return True, f"✅ Внесено {amount:.2f} Те."
 
 
-async def _do_withdraw(message: Message, player: dict, amount: float) -> bool:
-    """True — деньги сняты; False — отказ (сообщение пользователю уже отправлено)."""
-    players.bank_settle(player)  # фиксируем накопленные проценты в общий счётчик, не теряем их
+def _apply_withdraw(player: dict, amount: float) -> Tuple[bool, str]:
+    if amount > players.bank_current_balance(player) + 0.005:
+        return False, f"На вкладе только {players.bank_current_balance(player):.2f} Те."
+    players.bank_settle(player)  # фиксируем накопленные проценты, не теряем их
     bank = player["bank"]
-    if amount > bank["balance"] + 0.005:
-        await message.reply(f"На вкладе только {bank['balance']:.2f} Те." + HINT_TEXT)
-        return False
     amount = min(amount, bank["balance"])
     remaining = round(bank["balance"] - amount, 2)
     bank["balance"] = remaining
     bank["deposited_at"] = now() if remaining > 0 else None
     player["currency"] = round(player.get("currency", 0.0) + amount, 2)
-    await message.reply(
-        f"✅ Снято {amount:.2f} Те. На руках теперь: {player['currency']:.2f} Те.\n"
-        f"🏦 Осталось на вкладе: {remaining:.2f} Те." + HINT_TEXT
-    )
-    return True
+    return True, f"✅ Снято {amount:.2f} Те."
 
 
-async def _ask_amount(message: Message, state: FSMContext, chat_id: int, player: dict, deposit: bool) -> None:
-    """Показывает баланс и просит сумму. ForceReply открывает поле ответа на это сообщение:
-    такие ответы бот получает всегда, даже в группе с включённым режимом приватности."""
-    await message.reply(
-        _info_text(player) + (PROMPT_DEPOSIT if deposit else PROMPT_WITHDRAW),
-        reply_markup=ForceReply(selective=True, input_field_placeholder="Сумма, например 50, или «всё»"),
-    )
-    await state.update_data(chat_id=chat_id, tries=0)
-    await state.set_state(BankStates.waiting_deposit_amount if deposit else BankStates.waiting_withdraw_amount)
+def _run(player: dict, deposit: bool, token: Tuple[str, float]) -> Tuple[bool, str]:
+    """Выполняет операцию. Возвращает (получилось, строка_для_панели)."""
+    available = player.get("currency", 0.0) if deposit else players.bank_current_balance(player)
+    amount, err = _resolve_amount(token, available, deposit)
+    if err:
+        return False, "⚠️ " + err
+    ok, text = (_apply_deposit if deposit else _apply_withdraw)(player, amount)
+    return ok, text if ok else "⚠️ " + text
 
 
-async def _handle_bank_request(message: Message, state: FSMContext, action_text: str) -> None:
-    """action_text — всё, что идёт после слова 'банк'/'/bank' (может быть пустым)."""
+def _open_mode(player: dict, mode: str) -> Tuple[Optional[str], str]:
+    """Можно ли открыть режим ввода суммы: (режим_или_None, сообщение_если_нельзя)."""
+    if mode == "dep" and player.get("currency", 0.0) <= 0:
+        return None, "⚠️ На руках нет Те — вносить нечего."
+    if mode == "wd" and players.bank_current_balance(player) <= 0:
+        return None, "⚠️ На вкладе пусто — снимать нечего."
+    return mode, ""
+
+
+# ------------------------------------------------------------------ панель ---
+
+def _display_name(player: dict) -> str:
+    return f"@{player['username']}" if player.get("username") else player.get("first_name", "Игрок")
+
+
+def _panel_text(player: dict, notice: str = "", mode: Optional[str] = None) -> str:
+    cash = player.get("currency", 0.0)
+    balance = players.bank_current_balance(player)
+    principal = player.get("bank", {}).get("balance", 0.0)
+    accrued = round(max(balance - principal, 0.0), 2)   # накапало с последней операции
+    total = players.bank_total_interest_earned(player)  # накапало за всё время
+
+    lines = [f"🏦 <b>Банк</b> · {html.escape(_display_name(player))}"]
+    if notice:
+        lines += ["", html.escape(notice)]
+    lines += [
+        "",
+        f"💹 {config.BANK_DAILY_RATE * 100:g}% в день, сложный процент · снять можно в любой момент",
+        "",
+        f"💰 На руках: {cash:.2f} Те",
+        f"🏦 На вкладе: <b>{balance:.2f} Те</b> — с учётом уже накапавших процентов",
+    ]
+    if balance > 0 or total > 0:
+        lines.append(f"📈 Накапало с последней операции: +{accrued:.2f} Те")
+        if total > accrued + 0.004:
+            lines.append(f"💹 Всего начислено за всё время: {total:.2f} Те")
+
+    if mode == "dep":
+        lines += ["", "➕ <b>Сколько положить?</b>",
+                  "Напишите число, «всё» или «половина» (можно ответом на это сообщение) — или нажмите кнопку."]
+    elif mode == "wd":
+        lines += ["", "➖ <b>Сколько снять?</b>",
+                  "Напишите число, «всё» или «половина» (можно ответом на это сообщение) — или нажмите кнопку."]
+    else:
+        lines += ["", "Выберите действие 👇", "<i>Или командой: «Банк положить 50», «Банк снять всё».</i>"]
+    return "\n".join(lines)
+
+
+def _cb(act: str, game_chat_id: int, owner_id: int) -> str:
+    return f"bank:{act}:{game_chat_id}:{owner_id}"
+
+
+def _panel_kb(player: dict, game_chat_id: int, owner_id: int, mode: Optional[str]) -> InlineKeyboardMarkup:
+    btn = InlineKeyboardButton
+    if mode in ("dep", "wd"):
+        deposit = mode == "dep"
+        available = player.get("currency", 0.0) if deposit else players.bank_current_balance(player)
+        pfx = "dep" if deposit else "wd"
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [
+                btn(text=f"Всё · {available:.2f}", callback_data=_cb(pfx + "all", game_chat_id, owner_id)),
+                btn(text=f"Половина · {round(available / 2, 2):.2f}", callback_data=_cb(pfx + "half", game_chat_id, owner_id)),
+            ],
+            [btn(text="↩️ Назад", callback_data=_cb("menu", game_chat_id, owner_id))],
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        btn(text="➕ Положить", callback_data=_cb("dep", game_chat_id, owner_id)),
+        btn(text="➖ Снять", callback_data=_cb("wd", game_chat_id, owner_id)),
+    ]])
+
+
+def _remember(panel_chat_id: int, user_id: int, message_id: int, game_chat_id: int, mode: Optional[str]) -> None:
+    limit = time.time() - _WAIT_TTL
+    for key in [k for k, v in _WAIT.items() if v["ts"] < limit]:
+        _WAIT.pop(key, None)
+    _WAIT[(panel_chat_id, user_id)] = {
+        "mid": message_id, "game_chat_id": game_chat_id, "mode": mode, "ts": time.time(),
+    }
+
+
+async def _edit_panel(bot: Bot, chat_id: int, message_id: int, text: str, kb: InlineKeyboardMarkup) -> bool:
+    """True — панель обновлена (или текст не изменился). False — отредактировать нельзя
+    (сообщение удалено и т.п.)."""
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id, text=text, parse_mode="HTML", reply_markup=kb
+        )
+        return True
+    except Exception as e:
+        return "not modified" in str(e).lower()
+
+
+# ---------------------------------------------------- команда /bank, «Банк» ---
+
+async def _handle_bank_request(message: Message, action_text: str) -> None:
+    """action_text — всё, что идёт после слова 'банк'/'/bank' (может быть пустым).
+    Всегда отвечает ОДНИМ сообщением-панелью (с результатом, если была операция)."""
     parts = action_text.strip().split(maxsplit=1)
     action = parts[0].lower() if parts else ""
     amount_raw = parts[1] if len(parts) > 1 else ""
+    user = message.from_user
 
     async with Storage() as db:
-        chat_id, error = await resolve_chat_for_message(message, db)
+        game_chat_id, error = await resolve_chat_for_message(message, db)
         if error:
             await message.reply(error)
             return
-        chat = get_chat(db, chat_id)
-        player = players.get_or_create_player(
-            chat, message.from_user.id, message.from_user.username or "", message.from_user.first_name or "Игрок"
-        )
+        chat = get_chat(db, game_chat_id)
+        player = players.get_or_create_player(chat, user.id, user.username or "", user.first_name or "Игрок")
 
-        if action in ("положить", "внести"):
-            if not amount_raw:
-                await _ask_amount(message, state, chat_id, player, deposit=True)
-                return
-            amount, error = _parse_amount(amount_raw, player, for_withdraw=False)
-            if error == "не_число":
-                await message.reply("Сумма должна быть числом (или словом «всё»)." + HINT_TEXT)
-                return
-            if error:
-                await message.reply(error + HINT_TEXT)
-                return
-            await _do_deposit(message, player, amount)
-            return
+        notice, mode = "", None
+        if action in _DEPOSIT_VERBS + _WITHDRAW_VERBS:
+            deposit = action in _DEPOSIT_VERBS
+            wanted = "dep" if deposit else "wd"
+            if not amount_raw:  # «/bank положить» — сразу спрашиваем сумму
+                mode, notice = _open_mode(player, wanted)
+            else:
+                token = _parse_token(amount_raw)
+                if token is None:
+                    mode, notice = _open_mode(player, wanted)
+                    notice = notice or "⚠️ Сумма должна быть числом, «всё» или «половина»."
+                else:
+                    ok, notice = _run(player, deposit, token)
+                    mode = None if ok else wanted
+        elif action_text.strip():
+            token = _parse_token(action_text)  # «Банк 50» без глагола — внесение
+            if token is not None:
+                ok, notice = _run(player, True, token)
+                mode = None if ok else "dep"
+            else:
+                notice = "⚠️ Не понял команду — выберите действие кнопкой ниже."
 
-        if action in ("снять", "вывести"):
-            if not amount_raw:
-                await _ask_amount(message, state, chat_id, player, deposit=False)
-                return
-            amount, error = _parse_amount(amount_raw, player, for_withdraw=True)
-            if error == "не_число":
-                await message.reply("Сумма должна быть числом (или словом «всё»)." + HINT_TEXT)
-                return
-            if error:
-                await message.reply(error + HINT_TEXT)
-                return
-            await _do_withdraw(message, player, amount)
-            return
+        text = _panel_text(player, notice, mode)
+        kb = _panel_kb(player, game_chat_id, user.id, mode)
 
-        # «Банк 50» / «/bank всё» — голая сумма без глагола тоже считается внесением
-        if action_text.strip():
-            amount, err = _parse_amount(action_text, player, for_withdraw=False)
-            if not err:
-                await _do_deposit(message, player, amount)
-                return
-
-        # без аргументов (или нераспознанное слово) — просто показать информацию
-        # и сразу спросить, сколько внести, чтобы не нужно было звать команду снова
-        await _ask_amount(message, state, chat_id, player, deposit=True)
+    sent = await message.reply(text, reply_markup=kb, parse_mode="HTML")
+    if sent is not None and getattr(sent, "message_id", None):
+        _remember(message.chat.id, user.id, sent.message_id, game_chat_id, mode)
 
 
 @router.message(Command("bank"))
-async def cmd_bank(message: Message, state: FSMContext) -> None:
+async def cmd_bank(message: Message) -> None:
     args = message.text.split(maxsplit=1)
-    action_text = args[1] if len(args) > 1 else ""
-    await _handle_bank_request(message, state, action_text)
+    await _handle_bank_request(message, args[1] if len(args) > 1 else "")
 
 
 @router.message(F.text.regexp(r"(?i)^банк(\s|$)"))
-async def text_bank_trigger(message: Message, state: FSMContext) -> None:
+async def text_bank_trigger(message: Message) -> None:
+    await _handle_bank_request(message, message.text.strip()[4:].strip())  # всё, что после слова «банк»
+
+
+# ----------------------------------------------------------------- кнопки ---
+
+@router.callback_query(F.data.startswith("bank:"))
+async def cb_bank(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        _, act, game_chat_s, owner_s = callback.data.split(":")
+        game_chat_id, owner_id = int(game_chat_s), int(owner_s)
+    except ValueError:
+        await callback.answer()
+        return
+    if callback.message is None:
+        await callback.answer()
+        return
+    user = callback.from_user
+    if user.id != owner_id:
+        await callback.answer("Это банк другого игрока — вызовите /bank сами.", show_alert=True)
+        return
+
+    toast: Optional[str] = None
+    async with Storage() as db:
+        chat = get_chat(db, game_chat_id)
+        player = players.get_or_create_player(chat, user.id, user.username or "", user.first_name or "Игрок")
+        notice, mode = "", None
+
+        if act in ("dep", "wd"):
+            mode, why = _open_mode(player, act)
+            if mode is None:  # вносить/снимать нечего — остаёмся в обычном виде и объясняем всплывающим окном
+                toast = why.replace("⚠️ ", "")
+        elif act in ("depall", "dephalf", "wdall", "wdhalf"):
+            deposit = act.startswith("dep")
+            ok, notice = _run(player, deposit, ("all" if act.endswith("all") else "half", 0.0))
+            mode = None if ok else ("dep" if deposit else "wd")
+        elif act != "menu":
+            await callback.answer()
+            return
+
+        text = _panel_text(player, notice, mode)
+        kb = _panel_kb(player, game_chat_id, user.id, mode)
+
+    panel_chat_id, panel_mid = callback.message.chat.id, callback.message.message_id
+    if not await _edit_panel(bot, panel_chat_id, panel_mid, text, kb):
+        await callback.answer("Это сообщение устарело — вызовите /bank заново.", show_alert=True)
+        return
+    _remember(panel_chat_id, user.id, panel_mid, game_chat_id, mode)
+    await callback.answer(toast, show_alert=bool(toast))
+
+
+# ------------------------------------------------- сумма текстом в чат ------
+
+def _match_input(message: Message) -> Optional[dict]:
+    """Это сумма для открытой панели банка? Возвращает разобранный ввод или None.
+    Строго: болтовня в чате, ответы на чужие сообщения (например, на приглашение ставки)
+    и голые числа без выбранной кнопки сюда не попадают."""
+    if message.from_user is None or not message.text:
+        return None
+    wait = _WAIT.get((message.chat.id, message.from_user.id))
+    if not wait or time.time() - wait["ts"] > _WAIT_TTL:
+        return None
+    reply = message.reply_to_message
+    if reply is not None and getattr(reply, "forum_topic_created", None) is None and reply.message_id != wait["mid"]:
+        return None  # ответ на чужое сообщение
     text = message.text.strip()
-    action_text = text[4:].strip()  # всё, что после слова "банк"
-    await _handle_bank_request(message, state, action_text)
+    if text.startswith("/"):
+        return None
+    verb, rest = _split_verb(text)
+    token = _parse_token(rest)
+    if token is None:
+        return None
+    if not verb and not wait["mode"]:
+        return None  # голая сумма, а кнопка не нажата — это просто сообщение в чате
+    return {"wait": wait, "verb": verb, "token": token}
 
 
-async def _reprompt(message: Message, state: FSMContext, deposit: bool, why: str) -> None:
-    """Сумма не распознана — не отменяем сразу, а переспрашиваем (до MAX_TRIES раз)."""
-    data = await state.get_data()
-    tries = data.get("tries", 0) + 1
-    if tries >= MAX_TRIES:
-        await state.clear()
-        await message.reply(why + " Ввод отменён — наберите /bank ещё раз." + HINT_TEXT)
+async def _is_bank_input(message: Message) -> bool:
+    return _match_input(message) is not None
+
+
+@router.message(F.text, _is_bank_input)
+async def on_bank_text(message: Message, bot: Bot) -> None:
+    info = _match_input(message)
+    if info is None:
         return
-    await state.update_data(tries=tries)
-    await message.reply(
-        why + " Напишите число — например <code>50</code> — или «всё».",
-        reply_markup=ForceReply(selective=True, input_field_placeholder="Сумма, например 50, или «всё»"),
-    )
-
-
-async def _process_amount(message: Message, state: FSMContext, deposit: bool) -> None:
-    """Общий разбор ответа с суммой. Внутри режима «внести» понимает и «снять 50»,
-    внутри режима «снять» — и «положить 50»; лишние слова («Те», пробелы в числе) не мешают."""
-    if await check_command_escape(message, state):
-        return
-    data = await state.get_data()
-    chat_id = data.get("chat_id")
-    verb, rest = _split_verb(message.text or "")
-    if verb in _WITHDRAW_VERBS:
-        deposit_op = False
-    elif verb in _DEPOSIT_VERBS:
-        deposit_op = True
-    else:
-        deposit_op = deposit
-    if verb and not rest:
-        await _reprompt(message, state, deposit_op, "Не вижу суммы.")
-        return
+    wait, verb, token = info["wait"], info["verb"], info["token"]
+    deposit = (verb in _DEPOSIT_VERBS) if verb else (wait["mode"] == "dep")  # глагол главнее кнопки
+    wanted = "dep" if deposit else "wd"
+    user = message.from_user
 
     async with Storage() as db:
-        chat = get_chat(db, chat_id)
-        player = players.get_or_create_player(
-            chat, message.from_user.id, message.from_user.username or "", message.from_user.first_name or "Игрок"
-        )
-        amount, error = _parse_amount(rest, player, for_withdraw=not deposit_op)
-        if error:
-            done = None
-        else:
-            done = await (_do_deposit if deposit_op else _do_withdraw)(message, player, amount)
+        chat = get_chat(db, wait["game_chat_id"])
+        player = players.get_or_create_player(chat, user.id, user.username or "", user.first_name or "Игрок")
+        ok, notice = _run(player, deposit, token)
+        mode = None if ok else wanted
+        text = _panel_text(player, notice, mode)
+        kb = _panel_kb(player, wait["game_chat_id"], user.id, mode)
 
-    if error:
-        await _reprompt(message, state, deposit_op, "Не понял сумму." if error == "не_число" else error)
-    elif done:
-        await state.clear()
-    else:  # не хватает денег — отказ уже показан, даём попробовать другую сумму
-        await _reprompt(message, state, deposit_op, "Давайте другую сумму.")
-
-
-@router.message(StateFilter(BankStates.waiting_deposit_amount))
-async def process_deposit_amount(message: Message, state: FSMContext) -> None:
-    await _process_amount(message, state, deposit=True)
-
-
-@router.message(StateFilter(BankStates.waiting_withdraw_amount))
-async def process_withdraw_amount(message: Message, state: FSMContext) -> None:
-    await _process_amount(message, state, deposit=False)
+    if await _edit_panel(bot, message.chat.id, wait["mid"], text, kb):
+        _remember(message.chat.id, user.id, wait["mid"], wait["game_chat_id"], mode)
+        return
+    # панель удалили — присылаем новую
+    sent = await message.reply(text, reply_markup=kb, parse_mode="HTML")
+    if sent is not None and getattr(sent, "message_id", None):
+        _remember(message.chat.id, user.id, sent.message_id, wait["game_chat_id"], mode)

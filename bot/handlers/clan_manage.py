@@ -17,15 +17,16 @@ Callback-кнопки (подтверждения) хранят номер гр�
 продолжало работать, даже если сама кнопка пришла в личные сообщения.
 """
 
+import logging
 from typing import Optional
 
-from aiogram import Router, F
+from aiogram import Bot, Router, F
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import config
-from bot import betting
+from bot import betting, pins
 from bot.storage import Storage, now
 from bot.chat_state import get_chat, resolve_chat_for_message, all_chat_ids
 from bot.keyboards import confirm_kb
@@ -33,6 +34,15 @@ from bot.leaderboard import build_top_text, build_global_top_text
 from bot.season import finalize_season_locked
 
 router = Router(name="clan_manage")
+logger = logging.getLogger("clan_manage")
+
+
+async def _sweep_pins(bot: Bot, chat_id: int) -> None:
+    """Открепляет сообщения вызова/дуэли, которые мы только что сбросили в состоянии."""
+    try:
+        await pins.sweep(bot, chat_id)
+    except Exception:
+        logger.exception("Ошибка зачистки закрепов")
 
 
 # ------------------------------------------------------------------ /tixa --
@@ -272,7 +282,7 @@ async def cmd_delete_clan(message: Message) -> None:
 
 
 @router.callback_query(F.data.startswith("deleteclan:confirm:"))
-async def cb_delete_clan_confirm(callback: CallbackQuery) -> None:
+async def cb_delete_clan_confirm(callback: CallbackQuery, bot: Bot) -> None:
     _, _, chat_id_s, clan_id_s = callback.data.split(":")
     chat_id, clan_id = int(chat_id_s), int(clan_id_s)
 
@@ -303,6 +313,7 @@ async def cb_delete_clan_confirm(callback: CallbackQuery) -> None:
 
     await callback.message.edit_text(f"🗑 Клан «{clan_name}» расформирован.")
     await callback.answer()
+    await _sweep_pins(bot, chat_id)  # если у клана был вызов/дуэль — открепляем их сообщения
 
 
 @router.callback_query(F.data == "deleteclan:cancel")
@@ -497,7 +508,7 @@ async def cmd_reset_war(message: Message) -> None:
 
 
 @router.callback_query(F.data.startswith("resetwar:confirm:"))
-async def cb_reset_war_confirm(callback: CallbackQuery) -> None:
+async def cb_reset_war_confirm(callback: CallbackQuery, bot: Bot) -> None:
     if callback.from_user.id != config.ADMIN_ID:
         await callback.answer("Только владелец бота может это подтвердить.", show_alert=True)
         return
@@ -509,6 +520,7 @@ async def cb_reset_war_confirm(callback: CallbackQuery) -> None:
 
     await callback.message.edit_text(final_text + "\n\n🔄 Новый сезон начат!", parse_mode="HTML")
     await callback.answer()
+    await _sweep_pins(bot, chat_id)  # вызов/дуэли сброшены — открепляем их сообщения
 
 
 @router.callback_query(F.data == "resetwar:cancel")

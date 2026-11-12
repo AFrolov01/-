@@ -35,7 +35,7 @@ from bot.leaderboard import build_top_text
 from bot.clan_utils import ensure_clan_fields
 from bot.leveling import level_from_xp, apply_level_up_reputation
 from bot.reputation import add_reputation
-from bot import players, betting
+from bot import players, betting, pins
 
 
 # ------------------------------------------------------- завершение сезона -
@@ -166,7 +166,8 @@ def finalize_season_locked(chat: dict) -> str:
 async def _check_and_finalize(bot: Bot) -> None:
     """Сезон общий: проверяем ОДИН глобальный таймер, но при завершении
     подводим итоги в КАЖДОЙ группе отдельно и рассылаем туда её собственный текст."""
-    to_send = []  # (chat_id, text)
+    to_send = []   # (chat_id, text)
+    to_sweep = []  # группы, где сброшены вызов/дуэли — там надо открепить их сообщения
 
     async with Storage() as db:
         started = db.get("season_started_at")
@@ -184,6 +185,7 @@ async def _check_and_finalize(bot: Bot) -> None:
             if not chat["clans"]:
                 continue
             final_text = finalize_season_locked(chat)
+            to_sweep.append(chat_id)
             if final_text:
                 to_send.append((chat_id, final_text + "\n\n🔄 Начинается новый сезон!"))
 
@@ -193,6 +195,13 @@ async def _check_and_finalize(bot: Bot) -> None:
     for chat_id, text in to_send:
         try:
             await bot.send_message(chat_id, text, parse_mode="HTML")
+        except Exception:
+            pass
+    # итоги сезона сбрасывают вызов и дуэли в состоянии — их закрепленные сообщения иначе
+    # остались бы висеть навсегда (раньше так и было)
+    for chat_id in to_sweep:
+        try:
+            await pins.sweep(bot, chat_id)
         except Exception:
             pass
 

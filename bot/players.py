@@ -210,12 +210,18 @@ def bank_settle(player: dict) -> None:
     total_interest_earned и обновляет 'принцип' (balance) до текущей
     выросшей суммы — вызывать ПЕРЕД любым изменением суммы вклада
     (пополнение/снятие), чтобы проценты не терялись и не обнулялись в
-    отображении."""
+    отображении.
+
+    Отметка времени deposited_at сдвигается на «сейчас» вместе с фиксацией: иначе уже
+    учтённые проценты считались бы второй раз (раньше так случалось, если после
+    фиксации операция отклонялась — например, «на вкладе только X Те»)."""
     bank = player.setdefault("bank", {"balance": 0.0, "deposited_at": None, "total_interest_earned": 0.0})
     current_balance = bank_current_balance(player)
     growth = current_balance - bank.get("balance", 0.0)
     bank["total_interest_earned"] = round(bank.get("total_interest_earned", 0.0) + growth, 2)
     bank["balance"] = current_balance
+    if current_balance > 0 and bank.get("deposited_at"):
+        bank["deposited_at"] = time.time()
 
 
 def bank_days_left_to_withdraw(player: dict) -> float:

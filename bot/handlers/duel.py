@@ -39,11 +39,18 @@
 обе стороны доиграли — рассчитываются (_finalize_duel_result) и итог уходит
 ОТВЕТОМ на сообщение этой дуэли.
 
-ЗАКРЕПЛЕНИЕ: сообщение-вызов на дуэль закрепляется ботом; как только кто-то
-открывает выбор количества мин, вызов открепляется и закрепляется само меню
-выбора мин; когда дуэль (все попытки обеих сторон) завершена — открепляется.
+ЧИСТОТА ЧАТА: как только кто-то из вызванных пишет /minduel, сообщение-вызов
+УДАЛЯЕТСЯ, а вместо него приходит одно сообщение с правилами и выбором мин.
+
+ЗАКРЕПЛЕНИЕ (bot/pins.py): сообщение-вызов на дуэль закрепляется ботом; когда
+открывается выбор количества мин, вызов исчезает (удалён), а закрепляется само
+меню выбора мин; когда дуэль (все попытки обеих сторон) завершена — меню
+открепляется. Открепление делает pins.sweep(): он снимает всё, что бот закреплял, а
+сейчас не «живое», — поэтому оно срабатывает и когда кто-то не пришёл и началась
+новая дуэль, и при любом другом пропуске.
 """
 
+import logging
 import random
 from typing import Optional, Tuple
 
@@ -54,13 +61,14 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import config
 from bot.storage import Storage, now
-from bot import texts, game, players, tactics, betting
+from bot import texts, game, players, tactics, betting, pins
 from bot.invite_view import invite_view
 from bot.chat_state import get_chat, all_chat_ids
 from bot.clan_utils import ensure_clan_fields
 from bot.keyboards import mine_count_kb, board_kb, board_revealed_kb
 
 router = Router(name="duel")
+logger = logging.getLogger("duel")
 
 
 # ---------------------------------------------------------------- helpers --
@@ -97,13 +105,27 @@ def _mark_member_played(clan: dict, user_id: int) -> None:
     clan["last_played_at"] = now()
 
 
-async def _unpin_safe(bot: Bot, chat_id, message_id) -> None:
+async def _delete_safe(bot: Bot, chat_id, message_id) -> bool:
+    """Удаляет сообщение бота. True — удалено; False — не вышло (уже удалено, прошло
+    больше 48 часов и т.п.)."""
     if not chat_id or not message_id:
+        return False
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
+    except Exception:
+        return False
+
+
+async def _sweep_pins_safe(bot: Bot, chat_id) -> None:
+    """Открепляет всё лишнее (см. bot/pins.py). Дуэль к этому моменту уже убрана из
+    состояния, поэтому её меню выбора мин больше не «живое» и снимается."""
+    if not chat_id:
         return
     try:
-        await bot.unpin_chat_message(chat_id, message_id)
+        await pins.sweep(bot, chat_id)
     except Exception:
-        pass
+        logger.exception("Ошибка зачистки закрепов после дуэли")
 
 
 def _default_shop() -> dict:
@@ -398,7 +420,8 @@ async def _start_duel_core(bot: Bot, chat_id: int, user_id: int) -> Tuple[bool, 
     отправляется в саму ГРУППУ (там же, где хранится состояние войны и где
     его увидят все участники клана) — вызвавшему возвращается короткое
     подтверждение."""
-    invite_to_unpin = None
+    invite_msg = None          # (chat_id, message_id) сообщения-вызова: оно удаляется
+    invite_closed_text = None  # текст «ставки закрыты» — запасной вариант, если удалить не вышло
     async with Storage() as db:
         chat = get_chat(db, chat_id)
         invite = chat.get("pending_invite")
@@ -447,17 +470,16 @@ async def _start_duel_core(bot: Bot, chat_id: int, user_id: int) -> Tuple[bool, 
         # тотализатор: с запуском дуэли ставки закрываются. Поля игроков видны всей
         # группе, так что поздние ставки (на уже подорвавшегося) были бы нечестными.
         bets = invite.get("bets")
-        closed_invite = None
         if bets is not None:
             bets["open"] = False
             duel["bets"] = bets
             if invite.get("chat_id") and invite.get("message_id"):
                 view = invite_view(chat, invite, closed=True)
                 if view:
-                    closed_invite = (invite["chat_id"], invite["message_id"], view[0])
+                    invite_closed_text = view[0]
 
         if invite.get("chat_id") and invite.get("message_id"):
-            invite_to_unpin = (invite["chat_id"], invite["message_id"])
+            invite_msg = (invite["chat_id"], invite["message_id"])
 
         extra_note = ""
         max_attempts = max(invite.get("attempts_a", 1), invite.get("attempts_b", 1))
@@ -474,17 +496,19 @@ async def _start_duel_core(bot: Bot, chat_id: int, user_id: int) -> Tuple[bool, 
         }
         text = _rules_message_text(duel["start_info"], expanded=False)
 
-    if closed_invite:
-        try:
-            await bot.edit_message_text(
-                chat_id=closed_invite[0], message_id=closed_invite[1], text=closed_invite[2], parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[]),  # пустая клавиатура — кнопки ставок исчезают
-            )
-        except Exception:
-            pass
-
-    if invite_to_unpin:
-        await _unpin_safe(bot, invite_to_unpin[0], invite_to_unpin[1])
+    if invite_msg:
+        # вызов больше не нужен — удаляем его, чтобы не засорять чат: вместо него сразу ниже
+        # приходит сообщение с правилами и выбором мин. Не получилось удалить — хотя бы
+        # убираем кнопки ставок и показываем, что ставки закрыты.
+        if not await _delete_safe(bot, invite_msg[0], invite_msg[1]):
+            try:
+                await bot.edit_message_text(
+                    chat_id=invite_msg[0], message_id=invite_msg[1],
+                    text=invite_closed_text or "⚔️ Дуэль началась — выбор мин ниже 👇", parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[]),  # пустая клавиатура — кнопки ставок исчезают
+                )
+            except Exception:
+                pass
 
     sent = await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=mine_count_kb(duel_id, rules_expanded=False))
 
@@ -494,16 +518,18 @@ async def _start_duel_core(bot: Bot, chat_id: int, user_id: int) -> Tuple[bool, 
         if d:
             d["start_message_id"] = sent.message_id
 
-    try:
-        await bot.pin_chat_message(sent.chat.id, sent.message_id, disable_notification=True)
-        async with Storage() as db:
-            chat = get_chat(db, chat_id)
+    pinned = await pins.try_pin(bot, sent.chat.id, sent.message_id)
+    async with Storage() as db:
+        chat = get_chat(db, chat_id)
+        if pinned:
+            pins.register(chat, sent.message_id)  # в том же блоке, где сообщение становится «живым»
             d = chat["active_duels"].get(str(duel_id))
             if d:
                 d["pinned_chat_id"] = sent.chat.id
                 d["pinned_message_id"] = sent.message_id
-    except Exception:
-        pass
+
+    # вызов (если он остался закреплённым — например, не удалился) снимается с закрепа
+    await _sweep_pins_safe(bot, chat_id)
 
     return True, f"✅ Поле открыто в группе «{clan_a['name']} vs {clan_b['name']}» — заходите туда играть."
 
@@ -841,8 +867,8 @@ async def cb_cell(callback: CallbackQuery, bot: Bot) -> None:
             pass
     if finalize_text:
         await _send_finale(bot, callback.message.chat.id, finalize_text, finale_reply_to)
-    if pinned_to_unpin:
-        await _unpin_safe(bot, pinned_to_unpin[0], pinned_to_unpin[1])
+    if pinned_to_unpin:  # дуэль завершена — меню выбора мин больше не «живое», открепляем
+        await _sweep_pins_safe(bot, callback.message.chat.id)
 
 
 # --------------------------------------------------------------- cashout ---
@@ -916,8 +942,8 @@ async def cb_cashout(callback: CallbackQuery, bot: Bot) -> None:
             pass
     if finalize_text:
         await _send_finale(bot, callback.message.chat.id, finalize_text, finale_reply_to)
-    if pinned_to_unpin:
-        await _unpin_safe(bot, pinned_to_unpin[0], pinned_to_unpin[1])
+    if pinned_to_unpin:  # дуэль завершена — меню выбора мин больше не «живое», открепляем
+        await _sweep_pins_safe(bot, callback.message.chat.id)
 
 
 # ------------------------------------------------------------ AFK-хранитель
@@ -932,7 +958,7 @@ async def afk_watcher_loop(bot: Bot) -> None:
         try:
             await _check_afk_once(bot)
         except Exception:
-            pass
+            logger.exception("Ошибка проверки AFK")
 
 
 async def _check_afk_once(bot: Bot) -> None:
@@ -1008,5 +1034,5 @@ async def _check_afk_once(bot: Bot) -> None:
                 pass
         if finalize_text:
             await _send_finale(bot, chat_id, finalize_text, finale_reply_to)
-        if pinned_to_unpin:
-            await _unpin_safe(bot, pinned_to_unpin[0], pinned_to_unpin[1])
+        if pinned_to_unpin:  # дуэль завершена — открепляем
+            await _sweep_pins_safe(bot, chat_id)

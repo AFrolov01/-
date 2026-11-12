@@ -18,6 +18,7 @@
 """
 
 import asyncio
+import logging
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup
@@ -26,8 +27,10 @@ import config
 from bot.storage import Storage, now
 from bot.chat_state import get_chat, all_chat_ids
 from bot.clan_utils import ensure_clan_fields
-from bot import betting
+from bot import betting, pins
 from bot.invite_view import invite_view
+
+logger = logging.getLogger("turns")
 
 
 def _skip_note_for(clan: dict, player_id: int) -> str:
@@ -37,7 +40,7 @@ def _skip_note_for(clan: dict, player_id: int) -> str:
 
 
 async def _expire_pending_invites(bot: Bot) -> None:
-    to_unpin = []  # (chat_id, message_id)
+    to_sweep = []  # chat_id групп, где вызов сняли — там открепляем (bot/pins.py)
     to_edit = []   # (chat_id, message_id, text) — анонс без кнопок ставок
 
     async with Storage() as db:
@@ -57,8 +60,7 @@ async def _expire_pending_invites(bot: Bot) -> None:
                     clan["carried_attempts"] = clan.get("carried_attempts", 1) + 1
                     notes.append(_skip_note_for(clan, invite[player_key]))
 
-            if invite.get("chat_id") and invite.get("message_id"):
-                to_unpin.append((invite["chat_id"], invite["message_id"]))
+            to_sweep.append(chat_id)
 
             # вызов не принят — ставки зрителей возвращаются полностью (и купоны тоже)
             if invite.get("bets") is not None:
@@ -80,16 +82,13 @@ async def _expire_pending_invites(bot: Bot) -> None:
             )
         except Exception:
             pass
-    for chat_id, message_id in to_unpin:
-        try:
-            await bot.unpin_chat_message(chat_id, message_id)
-        except Exception:
-            pass
+    for chat_id in to_sweep:  # вызов уже не «живой» (pending_invite сброшен) — его закреп снимается
+        await pins.sweep(bot, chat_id)
 
 
 async def _expire_stuck_duel_sides(bot: Bot) -> None:
     notifications = []  # (chat_id, text, reply_to_message_id)
-    to_unpin = []
+    to_sweep = []       # группы, где дуэль закрыта из-за «не пришёл» — там открепляем
 
     async with Storage() as db:
         for chat_id in all_chat_ids(db):
@@ -122,26 +121,37 @@ async def _expire_stuck_duel_sides(bot: Bot) -> None:
                     text = _finalize_duel_result(chat, duel)
                     if text:
                         notifications.append((chat_id, text, duel.get("start_message_id")))
-                    if duel.get("pinned_chat_id") and duel.get("pinned_message_id"):
-                        to_unpin.append((duel["pinned_chat_id"], duel["pinned_message_id"]))
+                    to_sweep.append(chat_id)
                     del chat["active_duels"][duel_id]
 
     if notifications:
         from bot.handlers.duel import _send_finale
         for chat_id, text, reply_to in notifications:
             await _send_finale(bot, chat_id, text, reply_to)
-    for chat_id, message_id in to_unpin:
-        try:
-            await bot.unpin_chat_message(chat_id, message_id)
-        except Exception:
-            pass
+    for chat_id in to_sweep:  # дуэль закрыта — её меню выбора мин больше не «живое», открепляем
+        await pins.sweep(bot, chat_id)
 
 
 async def turn_watcher_loop(bot: Bot) -> None:
+    """Раз в 5 минут: снимает просроченные вызовы, закрывает дуэли, где кто-то не пришёл,
+    и подметает закрепы. Каждый шаг в своём try/except и с записью ошибки в лог — раньше
+    любой сбой молча глотался, и один упавший шаг блокировал все остальные."""
+    startup = True
     while True:
-        await asyncio.sleep(config.TURN_CHECK_INTERVAL_SECONDS)
+        if not startup:
+            await asyncio.sleep(config.TURN_CHECK_INTERVAL_SECONDS)
+        for name, step in (
+            ("снятие просроченных вызовов", _expire_pending_invites),
+            ("закрытие дуэлей с неявкой", _expire_stuck_duel_sides),
+        ):
+            try:
+                await step(bot)
+            except Exception:
+                logger.exception("Ошибка фоновой задачи: %s", name)
         try:
-            await _expire_pending_invites(bot)
-            await _expire_stuck_duel_sides(bot)
+            # страховка: открепляет всё, что бот закреплял и что уже не нужно. При старте бота
+            # (startup) — ещё и разовая зачистка закрепов, оставшихся от старых версий.
+            await pins.sweep_all(bot, legacy=startup)
         except Exception:
-            pass
+            logger.exception("Ошибка фоновой зачистки закрепов")
+        startup = False
